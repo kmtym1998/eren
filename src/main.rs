@@ -8,7 +8,17 @@ use gpui_kit::component::input::{Editor, EditorState, InputEvent, TabSize};
 use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
-actions!(eren, [SaveFile]);
+mod terminal;
+
+use terminal::TerminalSession;
+
+actions!(eren, [SaveFile, ToggleEditor]);
+
+/// ターミナル表示に使う等幅フォント。
+#[cfg(target_os = "macos")]
+const MONO_FONT: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
+const MONO_FONT: &str = "DejaVu Sans Mono";
 
 // ペインの階層を背景色で分け、選択と操作にだけ青を使う。
 const CANVAS: u32 = 0x1b1e24;
@@ -132,6 +142,12 @@ pub struct Workbench {
     file_error: Option<String>,
     status_message: Option<String>,
     _editor_subscription: Subscription,
+    /// 中央ペインの主役であるターミナル（プロジェクトを開くと起動する）。
+    terminal: Option<TerminalSession>,
+    terminal_error: Option<String>,
+    terminal_focus: FocusHandle,
+    /// エディタ（ツリー＋編集領域）を表示しているか。既定は非表示で、ターミナルがメイン。
+    editor_open: bool,
 }
 
 fn icon(name: Glyph) -> Icon {
@@ -183,6 +199,27 @@ impl Workbench {
                 cx.notify();
             }
         });
+        // ターミナルの出力更新（Wakeup フラグ）を定期的に拾って再描画する。
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+            let keep = this
+                .update(cx, |this, cx| {
+                    if this.terminal.as_ref().is_some_and(|session| {
+                        session
+                            .wake
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    }) {
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !keep {
+                break;
+            }
+        })
+        .detach();
         Self {
             project: None,
             picker_error: None,
@@ -196,6 +233,10 @@ impl Workbench {
             file_error: None,
             status_message: None,
             _editor_subscription: subscription,
+            terminal: None,
+            terminal_error: None,
+            terminal_focus: cx.focus_handle(),
+            editor_open: false,
         }
     }
 
@@ -208,6 +249,21 @@ impl Workbench {
         self.pending_path = None;
         self.file_error = None;
         self.status_message = None;
+        self.editor_open = false;
+        // ターミナルはプロジェクトのフォルダを起点に起動し直す。
+        if let Some(old) = &self.terminal {
+            old.shutdown();
+        }
+        match TerminalSession::new(&root, 100, 30) {
+            Ok(session) => {
+                self.terminal = Some(session);
+                self.terminal_error = None;
+            }
+            Err(error) => {
+                self.terminal = None;
+                self.terminal_error = Some(format!("ターミナルを起動できなかった: {error}"));
+            }
+        }
         self.project = Some(root);
     }
 
@@ -246,6 +302,8 @@ impl Workbench {
         self.file_error = None;
         self.status_message = None;
         self.pending_path = None;
+        // ファイルを開く操作ではエディタを表示する。
+        self.editor_open = true;
         match std::fs::metadata(&path) {
             Ok(meta) if meta.len() > MAX_FILE_BYTES => {
                 self.file_error = Some("ファイルが大きいため開けない（上限 2 MB）。".into());
@@ -586,14 +644,29 @@ impl Workbench {
                     .flex_shrink_0(),
             );
         }
-        header = header.child(div().flex_1()).child(
-            Button::new("save-file")
-                .ghost()
-                .small()
-                .label("保存")
-                .disabled(!self.dirty)
-                .on_click(cx.listener(|this, _, _, cx| this.save_file(cx))),
-        );
+        header = header
+            .child(div().flex_1())
+            .child(
+                Button::new("save-file")
+                    .ghost()
+                    .small()
+                    .label("保存")
+                    .disabled(!self.dirty)
+                    .on_click(cx.listener(|this, _, _, cx| this.save_file(cx))),
+            )
+            .child(
+                div()
+                    .id("close-editor")
+                    .cursor_pointer()
+                    .px_1()
+                    .text_color(rgb(MUTED))
+                    .child(icon(Glyph::X))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.editor_open = false;
+                        this.terminal_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
 
         let mut panel = panel.child(header);
         if let Some(_pending) = &self.pending_path {
@@ -657,6 +730,148 @@ impl Workbench {
         )
     }
 
+    fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor_open = !self.editor_open;
+        if self.editor_open {
+            if self.editing_path.is_some() {
+                self.editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+        } else {
+            self.terminal_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// canvas の実測サイズからターミナルの列数・行数を更新する。
+    fn terminal_resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.terminal {
+            if session.cols != cols || session.rows != rows {
+                session.resize(cols, rows);
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_terminal_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
+            if let Some(session) = &self.terminal {
+                session.write(&bytes);
+            }
+            // Ctrl+S などアプリ側のキーバインドへは回さない（ターミナル入力を優先）。
+            cx.stop_propagation();
+        }
+    }
+
+    fn terminal_panel(&self, cx: &Context<Self>) -> Div {
+        let mut header = panel_header("ターミナル", Glyph::Terminal);
+        header = header.child(div().flex_1()).child(
+            Button::new("toggle-editor")
+                .ghost()
+                .small()
+                .label(if self.editor_open {
+                    "エディタを隠す"
+                } else {
+                    "エディタを表示"
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_editor(window, cx))),
+        );
+        let panel = div().v_flex().flex_1().min_w_0().h_full().child(header);
+
+        if let Some(error) = &self.terminal_error {
+            return panel.child(
+                div()
+                    .flex_1()
+                    .v_flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().text_color(rgb(0xe9b4aa)).child(error.clone())),
+            );
+        }
+        let Some(session) = &self.terminal else {
+            return panel.child(
+                div()
+                    .flex_1()
+                    .v_flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child("プロジェクトを開くとターミナルが起動する"),
+                    ),
+            );
+        };
+
+        let snapshot = session.snapshot();
+        let default_bg = snapshot.default_bg;
+        let weak = cx.entity().downgrade();
+        let body = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .bg(rgb(CANVAS))
+            .overflow_hidden()
+            .track_focus(&self.terminal_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_terminal_key(event, window, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.terminal_focus.focus(window, cx);
+                }),
+            )
+            .child(
+                div().absolute().inset_0().child(
+                    canvas(
+                        move |bounds, _, cx| {
+                            let cols = (bounds.size.width / px(terminal::CELL_W)).floor() as usize;
+                            let rows = (bounds.size.height / px(terminal::CELL_H)).floor() as usize;
+                            if cols >= 2 && rows >= 1 {
+                                let _ = weak
+                                    .update(cx, |this, cx| this.terminal_resize(cols, rows, cx));
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .size_full(),
+                ),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .p_2()
+                    .font_family(MONO_FONT)
+                    .text_size(px(12.5))
+                    .children(snapshot.lines.iter().map(|line| {
+                        div()
+                            .h_flex()
+                            .h(px(terminal::CELL_H))
+                            .flex_shrink_0()
+                            .children(line.runs.iter().map(|run| {
+                                let mut run_div = div()
+                                    .flex_shrink_0()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(run.fg))
+                                    .child(run.text.clone());
+                                if run.bg != default_bg {
+                                    run_div = run_div.bg(rgb(run.bg));
+                                }
+                                if run.bold {
+                                    run_div = run_div.font_weight(FontWeight::BOLD);
+                                }
+                                run_div
+                            }))
+                    })),
+            );
+        panel.child(body)
+    }
+
     fn workspace(&self, cx: &Context<Self>) -> Div {
         if self.project.is_some() {
             return div()
@@ -665,14 +880,17 @@ impl Workbench {
                 .min_w_0()
                 .h_full()
                 .child(panel_header("作業領域", Glyph::CodeXml))
-                .child(
-                    div()
+                .child({
+                    let mut row = div()
                         .h_flex()
                         .flex_1()
                         .min_h_0()
-                        .child(self.tree_panel(cx))
-                        .child(self.viewer(cx)),
-                )
+                        .child(self.terminal_panel(cx));
+                    if self.editor_open {
+                        row = row.child(self.tree_panel(cx)).child(self.viewer(cx));
+                    }
+                    row
+                })
                 .child(
                     div()
                         .h(px(44.))
@@ -815,6 +1033,9 @@ impl Render for Workbench {
             .v_flex()
             .size_full()
             .on_action(cx.listener(|this, _: &SaveFile, _, cx| this.save_file(cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleEditor, window, cx| this.toggle_editor(window, cx)),
+            )
             .bg(rgb(CANVAS))
             .text_color(rgb(TEXT))
             .font_family(".AppleSystemUIFont")
@@ -877,6 +1098,69 @@ impl Render for Workbench {
     }
 }
 
+/// キー入力をターミナルへ送るバイト列に変換する。変換できないもの（Cmd 系など）は None。
+fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
+    let mods = &ks.modifiers;
+    if mods.platform {
+        return None;
+    }
+    if mods.control {
+        let key = ks.key.as_str();
+        if key.len() == 1 {
+            let byte = key.as_bytes()[0];
+            if byte.is_ascii_lowercase() {
+                return Some(vec![byte - b'a' + 1]);
+            }
+            match key {
+                "[" => return Some(vec![0x1b]),
+                "\\" => return Some(vec![0x1c]),
+                "]" => return Some(vec![0x1d]),
+                " " => return Some(vec![0]),
+                _ => {}
+            }
+        }
+        if key == "enter" {
+            return Some(vec![b'\r']);
+        }
+        return None;
+    }
+    let mut out = Vec::new();
+    if mods.alt {
+        out.push(0x1b);
+    }
+    if let Some(ch) = &ks.key_char {
+        if !ch.is_empty() {
+            out.extend_from_slice(ch.as_bytes());
+            return Some(out);
+        }
+    }
+    let seq: &[u8] = match ks.key.as_str() {
+        "enter" => b"\r",
+        "backspace" => &[0x7f],
+        "tab" => {
+            if mods.shift {
+                b"\x1b[Z"
+            } else {
+                b"\t"
+            }
+        }
+        "escape" => &[0x1b],
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "right" => b"\x1b[C",
+        "left" => b"\x1b[D",
+        "home" => b"\x1b[H",
+        "end" => b"\x1b[F",
+        "pageup" => b"\x1b[5~",
+        "pagedown" => b"\x1b[6~",
+        "delete" => b"\x1b[3~",
+        "space" => b" ",
+        _ => return None,
+    };
+    out.extend_from_slice(seq);
+    Some(out)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -905,6 +1189,8 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new("cmd-s", SaveFile, None),
                 KeyBinding::new("ctrl-s", SaveFile, None),
+                KeyBinding::new("cmd-e", ToggleEditor, None),
+                KeyBinding::new("ctrl-e", ToggleEditor, None),
             ]);
             Theme::change(ThemeMode::Dark, None, cx);
             Theme::update(cx, |theme| {
