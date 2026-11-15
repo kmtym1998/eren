@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::button::*;
 use gpui_kit::component::highlighter::Language;
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, TabSize};
+use gpui_kit::component::input::{
+    Editor, EditorState, Input, InputEvent, InputState, Position, TabSize,
+};
 use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
@@ -184,6 +186,23 @@ pub struct Workbench {
     diff_target: Option<String>,
     diff_text: Option<String>,
     diff_scroll: ScrollHandle,
+    /// プロジェクト横断検索の入力欄と結果。
+    search_input: Entity<InputState>,
+    search_query: String,
+    search_results: Vec<SearchMatch>,
+    search_truncated: bool,
+    _search_subscription: Subscription,
+    /// 検索結果から開くときのジャンプ先（未保存確認を挟む場合に保持する）。
+    pending_position: Option<Position>,
+}
+
+/// 横断検索のヒット1件。
+pub struct SearchMatch {
+    path: PathBuf,
+    rel: String,
+    line: u32,
+    col: u32,
+    text: String,
 }
 
 /// git status --porcelain の1エントリ。
@@ -259,6 +278,15 @@ impl Workbench {
                 cx.notify();
             }
         });
+        let search_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("検索して Enter（プロジェクト内）"));
+        let search_subscription =
+            cx.subscribe(&search_input, |this, state, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let query = state.read(cx).value().to_string();
+                    this.run_search(&query, cx);
+                }
+            });
         // ターミナルの出力更新（Wakeup フラグ）を定期的に拾って再描画する。
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -302,6 +330,12 @@ impl Workbench {
             diff_target: None,
             diff_text: None,
             diff_scroll: ScrollHandle::new(),
+            search_input,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_truncated: false,
+            _search_subscription: search_subscription,
+            pending_position: None,
         }
     }
 
@@ -317,6 +351,10 @@ impl Workbench {
         self.editor_open = false;
         self.diff_target = None;
         self.diff_text = None;
+        self.search_query = String::new();
+        self.search_results = Vec::new();
+        self.search_truncated = false;
+        self.pending_position = None;
         // ターミナルはプロジェクトのフォルダを起点に起動し直す。
         if let Some(old) = &self.terminal {
             old.shutdown();
@@ -426,6 +464,7 @@ impl Workbench {
             // 未保存のまま別ファイルへ行くときは、すぐ開かず確認バーを出す。
             if self.dirty {
                 self.pending_path = Some(path);
+                self.pending_position = None;
                 cx.notify();
                 return;
             }
@@ -435,9 +474,21 @@ impl Workbench {
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_path_at(path, None, window, cx);
+    }
+
+    /// ファイルを開く。`jump` があればその位置（0 始まりの行・列）へカーソルを移動する。
+    fn open_path_at(
+        &mut self,
+        path: PathBuf,
+        jump: Option<Position>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.file_error = None;
         self.status_message = None;
         self.pending_path = None;
+        self.pending_position = None;
         self.diff_target = None;
         self.diff_text = None;
         // ファイルを開く操作ではエディタを表示する。
@@ -480,8 +531,14 @@ impl Workbench {
         });
         self.editing_path = Some(path);
         self.dirty = false;
-        let focus_handle = self.editor.focus_handle(cx);
-        focus_handle.focus(window, cx);
+        if let Some(position) = jump {
+            self.editor.update(cx, |state, cx| {
+                state.set_cursor_position(position, window, cx);
+            });
+        } else {
+            let focus_handle = self.editor.focus_handle(cx);
+            focus_handle.focus(window, cx);
+        }
     }
 
     /// 編集中のファイルを保存する。保存不要・保存成功なら true、失敗なら false。
@@ -518,10 +575,12 @@ impl Workbench {
         let Some(pending) = self.pending_path.take() else {
             return;
         };
+        let position = self.pending_position.take();
         if self.save_current(cx) {
-            self.open_path(pending, window, cx);
+            self.open_path_at(pending, position, window, cx);
         } else {
             self.pending_path = Some(pending);
+            self.pending_position = position;
         }
         cx.notify();
     }
@@ -529,9 +588,98 @@ impl Workbench {
     /// 確認バーで「破棄して開く」が選ばれたとき。未保存の編集は捨てて開く。
     fn discard_and_open_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pending) = self.pending_path.take() {
-            self.open_path(pending, window, cx);
+            let position = self.pending_position.take();
+            self.open_path_at(pending, position, window, cx);
         }
         cx.notify();
+    }
+
+    /// プロジェクト内を横断検索する（部分一致、大文字小文字を区別しない）。
+    fn run_search(&mut self, query: &str, cx: &mut Context<Self>) {
+        let query = query.trim().to_string();
+        self.search_query = query.clone();
+        self.search_results = Vec::new();
+        self.search_truncated = false;
+        if query.is_empty() {
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.project.clone() else {
+            cx.notify();
+            return;
+        };
+        let needle = query.to_lowercase();
+        let mut results: Vec<SearchMatch> = Vec::new();
+        let walker = ignore::WalkBuilder::new(&root)
+            .sort_by_file_path(|a, b| a.cmp(b))
+            .build();
+        'outer: for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path().to_path_buf();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if bytes.iter().take(8192).any(|b| *b == 0) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (index, line) in text.lines().enumerate() {
+                if let Some(byte_idx) = line.to_lowercase().find(&needle) {
+                    let col = line[..byte_idx].chars().count() as u32;
+                    results.push(SearchMatch {
+                        rel: path
+                            .strip_prefix(&root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        path: path.clone(),
+                        line: index as u32,
+                        col,
+                        text: line.trim().chars().take(140).collect(),
+                    });
+                    if results.len() >= 300 {
+                        self.search_truncated = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        self.search_results = results;
+        cx.notify();
+    }
+
+    /// 検索結果をクリックしたとき：該当ファイルを開いて行へジャンプする。
+    fn open_search_match(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.search_results.get(index) else {
+            return;
+        };
+        let (path, position) = (m.path.clone(), Position::new(m.line, m.col));
+        // 開いているファイル自身なら、再読込せずカーソルだけ動かす（未保存の編集を守る）。
+        if self.editing_path.as_deref() == Some(path.as_path()) {
+            self.diff_target = None;
+            self.diff_text = None;
+            self.editor_open = true;
+            self.editor.update(cx, |state, cx| {
+                state.set_cursor_position(position, window, cx);
+            });
+            cx.notify();
+            return;
+        }
+        if self.dirty {
+            self.pending_path = Some(path);
+            self.pending_position = Some(position);
+            cx.notify();
+            return;
+        }
+        self.open_path_at(path, Some(position), window, cx);
     }
 
     fn open_project(&mut self, cx: &mut Context<Self>) {
@@ -728,7 +876,7 @@ impl Workbench {
             );
         }
 
-        div()
+        let mut panel = div()
             .v_flex()
             .w(px(264.))
             .flex_shrink_0()
@@ -737,7 +885,124 @@ impl Workbench {
             .border_r_1()
             .border_color(rgb(LINE))
             .child(header)
-            .child(list)
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(Input::new(&self.search_input).small()),
+            );
+        if self.search_query.is_empty() {
+            panel = panel.child(list);
+        } else {
+            panel = panel.child(self.search_results_view(cx));
+        }
+        panel
+    }
+
+    /// 横断検索の結果リスト（検索中はツリーの代わりに出す）。
+    fn search_results_view(&self, cx: &Context<Self>) -> Div {
+        let mut summary = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .text_size(px(11.))
+            .text_color(rgb(MUTED))
+            .child(format!(
+                "{} 件{}",
+                self.search_results.len(),
+                if self.search_truncated {
+                    "（上限で打ち切り）"
+                } else {
+                    ""
+                }
+            ));
+        summary = summary.child(div().flex_1()).child(
+            Button::new("clear-search")
+                .ghost()
+                .small()
+                .label("クリア")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.search_query = String::new();
+                    this.search_results = Vec::new();
+                    this.search_truncated = false;
+                    this.search_input.update(cx, |state, cx| {
+                        state.set_value("", window, cx);
+                    });
+                    cx.notify();
+                })),
+        );
+        let mut view = div().v_flex().flex_1().min_h_0().child(summary);
+        if self.search_results.is_empty() {
+            view = view.child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("見つからなかった"),
+            );
+        } else {
+            let mut list = div()
+                .id("search-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .py_1();
+            for (index, m) in self.search_results.iter().enumerate() {
+                let item = div()
+                    .id(("search-row", index as u64))
+                    .v_flex()
+                    .gap(px(1.))
+                    .px_3()
+                    .py(px(5.))
+                    .mx_2()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(SURFACE)))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(12.))
+                                    .child(m.rel.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(MONO_FONT)
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .child(format!(":{}", m.line + 1)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(m.text.clone()),
+                    );
+                list = list.child(item.on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_search_match(index, window, cx);
+                })));
+            }
+            view = view.child(list);
+        }
+        view
     }
 
     fn viewer(&self, cx: &Context<Self>) -> Div {

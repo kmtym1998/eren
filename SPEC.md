@@ -29,7 +29,7 @@ Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15
 - [x] プロジェクトを開く（フォルダ選択 → ファイルツリー表示、`.git/HEAD` からブランチ名表示。CLI 引数でフォルダを渡しても開ける）※ worktree 一覧は未
 - [x] ファイルツリー → コードエディタ（EditorState 化済み 2026-11-15：そのまま編集でき、保存ボタン / Cmd+S・Ctrl+S で保存、未保存はドット表示。tree-sitter ハイライトは rust / typescript / tsx / javascript / toml / markdown / css / html / bash / yaml / python + json に対応。未保存のまま別ファイルへ切り替える際は確認バーで「保存して開く／破棄して開く／キャンセル」を選ぶ。ローカル実装済み 2026-11-15、未 push）
 - [x] Changes：git status の変更一覧 + Diff 表示（unified、2026-11-15 ローカル実装）：右ペインに件数バッジ付きで変更ファイルを一覧（XY ステータスの色分けバッジ、更新ボタン、保存時にも自動更新）。クリックで `git diff HEAD`（未追跡は /dev/null との diff）を色付きでエディタ領域に表示。split 表示は今後の拡張
-- [ ] 横断検索：ripgrep 系 crate（grep-searcher + ignore）で結果一覧 → 行ジャンプ
+- [x] 横断検索（2026-11-15 実装）：ツリーパネル上部の入力欄に語を入れて Enter で、ignore クレートでプロジェクトを走査（.gitignore 尊重、2MB 超とバイナリは除外）し、部分一致（大文字小文字を区別しない、上限300件）の結果一覧を表示。クリックでファイルを開いて該当行へジャンプ（未保存時は確認バーを経由）
 
 ### Phase 2（LSP）
 - [ ] LSP クライアント配線（lsp-types + async-lsp 系、サーバー管理は (server, workspace root) キー）
