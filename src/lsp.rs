@@ -1,0 +1,519 @@
+//! 最小の LSP クライアント。
+//!
+//! 言語サーバーを子プロセスとして起動し、stdio の JSON-RPC で通信する。
+//! 読み取りは専用スレッド、リクエストは呼び出し側スレッドでブロックして待つ。
+//! 同期は全文同期（didOpen / didChange で全文を送る）のみ。
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+/// ジャンプ先（LSP の Location / LocationLink を正規化したもの）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspLocation {
+    pub path: PathBuf,
+    /// 0 始まりの行。
+    pub line: u32,
+    /// 0 始まりの列（UTF-16 コードユニット数）。
+    pub character: u32,
+}
+
+type PendingMap = HashMap<i64, mpsc::Sender<Result<Value, String>>>;
+
+/// 診断の保持・hover・did_close は次のスライス（診断表示 / hover UI）で使う。
+#[allow(dead_code)]
+pub struct LspClient {
+    _child: Mutex<Child>,
+    writer: Arc<Mutex<ChildStdin>>,
+    pending: Arc<Mutex<PendingMap>>,
+    diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    versions: Mutex<HashMap<String, i64>>,
+    next_id: AtomicI64,
+    /// initialize の応答に含まれるサーバーの capabilities。
+    pub capabilities: Value,
+    pub root: PathBuf,
+}
+
+fn write_message(writer: &Arc<Mutex<ChildStdin>>, value: &Value) -> Result<(), String> {
+    let body = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    let mut stdin = writer.lock().map_err(|_| "ロック失敗".to_string())?;
+    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)
+        .and_then(|()| stdin.flush())
+        .map_err(|e| e.to_string())
+}
+
+/// フレーム（ヘッダ＋本文）を1つ読み取る。EOF なら None。
+fn read_message(reader: &mut BufReader<impl Read>) -> Option<Value> {
+    let mut content_length: usize = 0;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    if content_length == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; content_length];
+    reader.read_exact(&mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+#[allow(dead_code)]
+impl LspClient {
+    /// サーバーを起動し、initialize ハンドシェイクまで終える。
+    pub fn spawn(program: &str, args: &[&str], root: &Path) -> Result<LspClient, String> {
+        let mut child = Command::new(program)
+            .args(args)
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("言語サーバーを起動できなかった: {e}"))?;
+        let stdin = child.stdin.take().ok_or("stdin を取得できなかった")?;
+        let stdout = child.stdout.take().ok_or("stdout を取得できなかった")?;
+        let writer = Arc::new(Mutex::new(stdin));
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        {
+            let writer = Arc::clone(&writer);
+            let pending = Arc::clone(&pending);
+            let diagnostics = Arc::clone(&diagnostics);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                while let Some(message) = read_message(&mut reader) {
+                    let id = message.get("id").cloned();
+                    let method = message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    match (id, method) {
+                        (Some(id), None) => {
+                            // サーバーからの応答。
+                            let result = if let Some(error) = message.get("error") {
+                                Err(error.to_string())
+                            } else {
+                                Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                            };
+                            if let Some(key) = id.as_i64() {
+                                if let Some(sender) = pending.lock().unwrap().remove(&key) {
+                                    let _ = sender.send(result);
+                                }
+                            }
+                        }
+                        (Some(id), Some(method)) => {
+                            // サーバーからのリクエストには最小限だけ応答する。
+                            let result = if method == "workspace/configuration" {
+                                let count = message
+                                    .pointer("/params/items")
+                                    .and_then(Value::as_array)
+                                    .map_or(1, Vec::len);
+                                Value::Array(vec![Value::Null; count])
+                            } else {
+                                Value::Null
+                            };
+                            let _ = write_message(
+                                &writer,
+                                &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                            );
+                        }
+                        (None, Some(method)) => {
+                            // 通知。診断だけ保持する。
+                            if method == "textDocument/publishDiagnostics" {
+                                if let Some(uri) =
+                                    message.pointer("/params/uri").and_then(Value::as_str)
+                                {
+                                    let list = message
+                                        .pointer("/params/diagnostics")
+                                        .and_then(Value::as_array)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    diagnostics.lock().unwrap().insert(uri.to_string(), list);
+                                }
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
+            });
+        }
+
+        let mut client = LspClient {
+            _child: Mutex::new(child),
+            writer,
+            pending,
+            diagnostics,
+            versions: Mutex::new(HashMap::new()),
+            next_id: AtomicI64::new(1),
+            capabilities: Value::Null,
+            root: root.to_path_buf(),
+        };
+
+        let root_uri = path_to_uri(root);
+        let result = client.request(
+            "initialize",
+            json!({
+                "processId": Value::Null,
+                "rootUri": root_uri,
+                "workspaceFolders": [{"uri": root_uri, "name": "root"}],
+                "capabilities": {
+                    "textDocument": {
+                        "synchronization": {"didSave": true},
+                        "definition": {"linkSupport": true},
+                        "implementation": {"linkSupport": true},
+                        "references": {},
+                        "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "publishDiagnostics": {}
+                    },
+                    "workspace": {"configuration": true}
+                }
+            }),
+        )?;
+        client.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
+        client.notify("initialized", json!({}))?;
+        Ok(client)
+    }
+
+    /// サーバーが capabilities で宣言しているかどうかをざっくり判定する。
+    pub fn supports(&self, capability_key: &str) -> bool {
+        match self.capabilities.get(capability_key) {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => true,
+        }
+    }
+
+    pub fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (sender, receiver) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id, sender);
+        write_message(
+            &self.writer,
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        )?;
+        match receiver.recv_timeout(Duration::from_secs(60)) {
+            Ok(result) => result,
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                Err("言語サーバーが応答しなかった".into())
+            }
+        }
+    }
+
+    pub fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+        write_message(
+            &self.writer,
+            &json!({"jsonrpc": "2.0", "method": method, "params": params}),
+        )
+    }
+
+    pub fn did_open(&self, path: &Path, language_id: &str, text: &str) {
+        let uri = path_to_uri(path);
+        self.versions.lock().unwrap().insert(uri.clone(), 1);
+        let _ = self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+    }
+
+    /// 全文同期で変更を送る。
+    pub fn did_change(&self, path: &Path, text: &str) {
+        let uri = path_to_uri(path);
+        let version = {
+            let mut versions = self.versions.lock().unwrap();
+            let version = versions.entry(uri.clone()).or_insert(1);
+            *version += 1;
+            *version
+        };
+        let _ = self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": text}]
+            }),
+        );
+    }
+
+    pub fn did_close(&self, path: &Path) {
+        let uri = path_to_uri(path);
+        self.versions.lock().unwrap().remove(&uri);
+        let _ = self.notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": uri}}),
+        );
+    }
+
+    /// 定義・実装ジャンプ共通。method は "textDocument/definition" など。
+    pub fn goto(
+        &self,
+        method: &str,
+        path: &Path,
+        text: &str,
+        byte_offset: usize,
+    ) -> Result<Vec<LspLocation>, String> {
+        let (line, character) = offset_to_position(text, byte_offset);
+        let result = self.request(
+            method,
+            json!({
+                "textDocument": {"uri": path_to_uri(path)},
+                "position": {"line": line, "character": character}
+            }),
+        )?;
+        Ok(parse_locations(&result))
+    }
+
+    pub fn hover(
+        &self,
+        path: &Path,
+        text: &str,
+        byte_offset: usize,
+    ) -> Result<Option<String>, String> {
+        let (line, character) = offset_to_position(text, byte_offset);
+        let result = self.request(
+            "textDocument/hover",
+            json!({
+                "textDocument": {"uri": path_to_uri(path)},
+                "position": {"line": line, "character": character}
+            }),
+        )?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let contents = &result["contents"];
+        let text = if let Some(value) = contents.get("value").and_then(Value::as_str) {
+            value.to_string()
+        } else if let Some(array) = contents.as_array() {
+            array
+                .iter()
+                .filter_map(|item| {
+                    item.as_str().map(str::to_string).or_else(|| {
+                        item.get("value")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(text))
+    }
+
+    /// uri に対する最新の診断（publishDiagnostics で届いたもの）。
+    pub fn diagnostics_for(&self, path: &Path) -> Vec<Value> {
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .get(&path_to_uri(path))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Location / LocationLink / その配列 / null を正規化する。
+fn parse_locations(result: &Value) -> Vec<LspLocation> {
+    fn one(value: &Value) -> Option<LspLocation> {
+        if let (Some(uri), Some(range)) =
+            (value.get("uri").and_then(Value::as_str), value.get("range"))
+        {
+            let start = range.get("start")?;
+            return Some(LspLocation {
+                path: uri_to_path(uri),
+                line: start.get("line")?.as_u64()? as u32,
+                character: start.get("character")?.as_u64()? as u32,
+            });
+        }
+        if let (Some(uri), Some(range)) = (
+            value.get("targetUri").and_then(Value::as_str),
+            value
+                .get("targetSelectionRange")
+                .or_else(|| value.get("targetRange")),
+        ) {
+            let start = range.get("start")?;
+            return Some(LspLocation {
+                path: uri_to_path(uri),
+                line: start.get("line")?.as_u64()? as u32,
+                character: start.get("character")?.as_u64()? as u32,
+            });
+        }
+        None
+    }
+    if result.is_null() {
+        return Vec::new();
+    }
+    if let Some(array) = result.as_array() {
+        return array.iter().filter_map(one).collect();
+    }
+    one(result).into_iter().collect()
+}
+
+/// バイトオフセット → LSP 位置（行は 0 始まり、列は UTF-16 コードユニット数）。
+pub fn offset_to_position(text: &str, byte_offset: usize) -> (u32, u32) {
+    let mut line: u32 = 0;
+    let mut character: u32 = 0;
+    for (index, ch) in text.char_indices() {
+        if index >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += ch.len_utf16() as u32;
+        }
+    }
+    (line, character)
+}
+
+/// LSP 位置 → バイトオフセット。範囲外はテキスト末尾に丸める。
+pub fn position_to_offset(text: &str, line: u32, character: u32) -> usize {
+    let mut current_line: u32 = 0;
+    let mut line_start = 0usize;
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            if current_line == line {
+                break;
+            }
+            current_line += 1;
+            line_start = index + 1;
+        }
+    }
+    if current_line < line {
+        return text.len();
+    }
+    let mut utf16_count: u32 = 0;
+    let mut offset = line_start;
+    for (index, ch) in text[line_start..].char_indices() {
+        if ch == '\n' || utf16_count >= character {
+            break;
+        }
+        utf16_count += ch.len_utf16() as u32;
+        offset = line_start + index + ch.len_utf8();
+    }
+    offset
+}
+
+/// ファイルパス → file:// URI（最小限のパーセントエンコード付き）。
+pub fn path_to_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut uri = String::from("file://");
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'~' | b'-') {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
+}
+
+/// file:// URI → ファイルパス。
+pub fn uri_to_path(uri: &str) -> PathBuf {
+    let stripped = uri.strip_prefix("file://").unwrap_or(uri);
+    let stripped = stripped.strip_prefix("localhost").unwrap_or(stripped);
+    let bytes = stripped.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                decoded.push(value);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_conversion_roundtrip() {
+        let text = "fn main() {\n    let s = \"あ🎉\";\n}\n";
+        // 「あ」は UTF-16 で1、🎉 は2（サロゲートペア）。
+        let offset = text.find('🎉').unwrap();
+        let (line, character) = offset_to_position(text, offset);
+        assert_eq!(line, 1);
+        assert_eq!(position_to_offset(text, line, character), offset);
+        let after = offset + '🎉'.len_utf8();
+        let (_, character2) = offset_to_position(text, after);
+        assert_eq!(character2, character + 2);
+    }
+
+    #[test]
+    fn uri_roundtrip_with_japanese() {
+        let path = PathBuf::from("/tmp/テスト dir/main.rs");
+        let uri = path_to_uri(&path);
+        assert!(uri.starts_with("file:///tmp/"));
+        assert_eq!(uri_to_path(&uri), path);
+    }
+
+    /// 実サーバー（rust-analyzer）での結合テスト。通常の test では回さず、
+    /// `cargo test -- --ignored` で明示実行する。
+    #[test]
+    #[ignore]
+    fn rust_analyzer_definition() {
+        let dir = std::env::temp_dir().join("eren-lsp-fixture");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let source = "fn helper() -> i32 {\n    42\n}\n\nfn main() {\n    let x = helper();\n    println!(\"{x}\");\n}\n";
+        std::fs::write(dir.join("src/main.rs"), source).unwrap();
+
+        let client = LspClient::spawn("rust-analyzer", &[], &dir).expect("spawn");
+        assert!(client.supports("definitionProvider"));
+        let main_rs = dir.join("src/main.rs");
+        client.did_open(&main_rs, "rust", source);
+        let call_offset = source.rfind("helper()").unwrap();
+        let mut locations = Vec::new();
+        for _ in 0..30 {
+            locations = client
+                .goto("textDocument/definition", &main_rs, source, call_offset)
+                .expect("definition");
+            if !locations.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        assert_eq!(locations.len(), 1, "定義が1件返るはず: {locations:?}");
+        assert_eq!(locations[0].line, 0, "helper の定義は0行目");
+        assert!(locations[0].path.ends_with("src/main.rs"));
+    }
+}

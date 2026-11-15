@@ -21,3 +21,4 @@ gpui-kit = { version = "0.9", features = [
 ] }
 alacritty_terminal = "0.25"
 ignore = "0.4"
+serde_json = "1"

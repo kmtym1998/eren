@@ -32,9 +32,10 @@ Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15
 - [x] 横断検索（2026-11-15 実装）：ツリーパネル上部の入力欄に語を入れて Enter で、ignore クレートでプロジェクトを走査（.gitignore 尊重、2MB 超とバイナリは除外）し、部分一致（大文字小文字を区別しない、上限300件）の結果一覧を表示。クリックでファイルを開いて該当行へジャンプ（未保存時は確認バーを経由）
 
 ### Phase 2（LSP）
-- [ ] LSP クライアント配線（lsp-types + async-lsp 系、サーバー管理は (server, workspace root) キー）
-- [ ] rust-analyzer で definition / implementation / references / hover
-- [ ] UTF-16 位置変換、index 完了待ち、外部変更の再同期（watcher）
+- [x] LSP クライアント基盤（2026-11-15 実装）：`src/lsp.rs` に自前の最小 JSON-RPC クライアント（stdio、読み取り専用スレッド＋同期リクエスト、全文同期）。当初案の async-lsp は使わず同期スレッド方式にした（GPUI のバックグラウンドタスクから呼ぶ）。initialize で capabilities を保持し、対応可否でジャンプを出し分ける
+- [x] rust-analyzer で definition / implementation ジャンプ（2026-11-15 実装）：プロジェクト（Cargo.toml あり）を開くとバックグラウンドで自動起動。F12=定義、Ctrl+F12=実装、エディタヘッダーにもボタン。複数ヒットは候補リスト、戻る/進む履歴（Alt+←/→）付き。UTF-16 位置変換あり（単体テスト＋実サーバー結合テスト＋GUI 確認済み）。rust-analyzer は rustup の shim ではなく toolchain 実体を優先して解決する
+- [ ] references / hover の UI、診断表示
+- [ ] TypeScript サーバー対応、外部変更の再同期（watcher）、index 完了待ちの表示
 
 ### Phase 3（ターミナル + agent 管理）
 - [x] ターミナル pane の土台（前倒しで実施、2026-11-15 ローカル実装）：alacritty_terminal 0.25 + PTY でログインシェルをプロジェクトフォルダで起動。グリッド描画（色・太字・反転・ブロックカーソル）、キー入力（Ctrl 組み合わせ・矢印・Alt プレフィックス）、ペインサイズへの追従（canvas 実測で cols/rows を再計算）。中央ペインの主役として常時表示され、エディタはトグル表示。残り：マウス選択・コピー、日本語 IME 入力、複数ターミナル

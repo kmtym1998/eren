@@ -10,11 +10,22 @@ use gpui_kit::component::input::{
 use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
+mod lsp;
 mod terminal;
 
 use terminal::TerminalSession;
 
-actions!(eren, [SaveFile, ToggleEditor]);
+actions!(
+    eren,
+    [
+        SaveFile,
+        ToggleEditor,
+        GotoDefinition,
+        GotoImplementation,
+        NavigateBack,
+        NavigateForward
+    ]
+);
 
 /// ターミナル表示に使う等幅フォント。
 #[cfg(target_os = "macos")]
@@ -194,6 +205,92 @@ pub struct Workbench {
     _search_subscription: Subscription,
     /// 検索結果から開くときのジャンプ先（未保存確認を挟む場合に保持する）。
     pending_position: Option<Position>,
+    /// 言語サーバー（rust-analyzer）のクライアント。起動はバックグラウンドで行い、
+    /// 準備ができたらここに入る。
+    lsp: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<lsp::LspClient>>>>,
+    /// 言語サーバーの起動に失敗した場合の理由。
+    lsp_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// LSP に didOpen 済みのファイル。
+    lsp_open_docs: HashSet<PathBuf>,
+    /// ジャンプ候補（複数ヒット時）とジャンプ元の位置。
+    goto_candidates: Option<(Vec<GotoCandidate>, (PathBuf, Position))>,
+    /// コードジャンプの戻る/進む履歴。
+    nav_back: Vec<(PathBuf, Position)>,
+    nav_forward: Vec<(PathBuf, Position)>,
+}
+
+/// 定義・実装ジャンプの候補1件。
+pub struct GotoCandidate {
+    path: PathBuf,
+    position: Position,
+    label: String,
+}
+
+/// （行, 列）位置 → バイトオフセット。列は文字数（GPUI の Position の流儀）。
+fn char_position_to_offset(text: &str, line: u32, character: u32) -> usize {
+    let mut current_line = 0u32;
+    let mut line_start = 0usize;
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            if current_line == line {
+                break;
+            }
+            current_line += 1;
+            line_start = index + 1;
+        }
+    }
+    if current_line < line {
+        return text.len();
+    }
+    let mut offset = line_start;
+    for (count, (index, ch)) in text[line_start..].char_indices().enumerate() {
+        if ch == '\n' || count as u32 >= character {
+            break;
+        }
+        offset = line_start + index + ch.len_utf8();
+    }
+    offset
+}
+
+/// バイトオフセット → （行, 列）位置。列は文字数。
+fn offset_to_char_position(text: &str, byte_offset: usize) -> Position {
+    let mut line = 0u32;
+    let mut character = 0u32;
+    for (index, ch) in text.char_indices() {
+        if index >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += 1;
+        }
+    }
+    Position::new(line, character)
+}
+
+/// rust-analyzer の実行パス。GUI 起動時は PATH に無いことがあるので実体を探す。
+/// rustup の shim は環境変数に依存して失敗することがあるため、toolchain の実体を優先する。
+fn rust_analyzer_program() -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if let Ok(entries) = std::fs::read_dir(home.join(".rustup/toolchains")) {
+            let mut toolchains: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            toolchains.sort();
+            for toolchain in toolchains {
+                let candidate = toolchain.join("bin/rust-analyzer");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        let shim = home.join(".cargo/bin/rust-analyzer");
+        if shim.exists() {
+            return shim.to_string_lossy().into_owned();
+        }
+    }
+    "rust-analyzer".to_string()
 }
 
 /// 横断検索のヒット1件。
@@ -273,9 +370,12 @@ impl Workbench {
                 .placeholder("ファイルを選ぶと、ここで編集できる")
         });
         let subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) && !this.dirty {
-                this.dirty = true;
-                cx.notify();
+            if matches!(event, InputEvent::Change) {
+                if !this.dirty {
+                    this.dirty = true;
+                    cx.notify();
+                }
+                this.sync_lsp_change(cx);
             }
         });
         let search_input = cx
@@ -336,6 +436,12 @@ impl Workbench {
             search_truncated: false,
             _search_subscription: search_subscription,
             pending_position: None,
+            lsp: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            lsp_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            lsp_open_docs: HashSet::new(),
+            goto_candidates: None,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
         }
     }
 
@@ -355,6 +461,28 @@ impl Workbench {
         self.search_results = Vec::new();
         self.search_truncated = false;
         self.pending_position = None;
+        self.lsp_open_docs.clear();
+        self.goto_candidates = None;
+        self.nav_back.clear();
+        self.nav_forward.clear();
+        *self.lsp.lock().unwrap() = None;
+        *self.lsp_error.lock().unwrap() = None;
+        // Rust プロジェクトなら言語サーバーをバックグラウンドで起動する。
+        if root.join("Cargo.toml").exists() {
+            let slot = std::sync::Arc::clone(&self.lsp);
+            let error_slot = std::sync::Arc::clone(&self.lsp_error);
+            let root_for_thread = root.clone();
+            std::thread::spawn(move || {
+                match lsp::LspClient::spawn(&rust_analyzer_program(), &[], &root_for_thread) {
+                    Ok(client) => {
+                        *slot.lock().unwrap() = Some(std::sync::Arc::new(client));
+                    }
+                    Err(error) => {
+                        *error_slot.lock().unwrap() = Some(error);
+                    }
+                }
+            });
+        }
         // ターミナルはプロジェクトのフォルダを起点に起動し直す。
         if let Some(old) = &self.terminal {
             old.shutdown();
@@ -527,8 +655,16 @@ impl Workbench {
             .unwrap_or_else(|| "plain".to_string());
         self.editor.update(cx, |state, cx| {
             state.set_highlighter(language, cx);
-            state.set_value(text, window, cx);
+            state.set_value(text.clone(), window, cx);
         });
+        // 言語サーバーが起動していれば、このファイルを開いたことを伝える。
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            let client = self.lsp.lock().unwrap().clone();
+            if let Some(client) = client {
+                client.did_open(&path, "rust", &text);
+                self.lsp_open_docs.insert(path.clone());
+            }
+        }
         self.editing_path = Some(path);
         self.dirty = false;
         if let Some(position) = jump {
@@ -654,6 +790,228 @@ impl Workbench {
         }
         self.search_results = results;
         cx.notify();
+    }
+
+    /// 編集内容を言語サーバーへ全文同期する（didOpen 済みのファイルだけ）。
+    fn sync_lsp_change(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.editing_path.clone() else {
+            return;
+        };
+        if !self.lsp_open_docs.contains(&path) {
+            return;
+        }
+        let client = self.lsp.lock().unwrap().clone();
+        if let Some(client) = client {
+            let text = self.editor.read(cx).text().to_string();
+            client.did_change(&path, &text);
+        }
+    }
+
+    fn goto_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto("textDocument/definition", "定義", window, cx);
+    }
+
+    fn goto_implementation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto("textDocument/implementation", "実装", window, cx);
+    }
+
+    /// 定義・実装ジャンプ共通処理。サーバーへの問い合わせはバックグラウンドで行う。
+    fn goto(
+        &mut self,
+        method: &str,
+        kind_label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.editing_path.clone() else {
+            return;
+        };
+        if self.diff_target.is_some() {
+            return;
+        }
+        let client = self.lsp.lock().unwrap().clone();
+        let Some(client) = client else {
+            if let Some(error) = self.lsp_error.lock().unwrap().clone() {
+                self.status_message = Some(format!("言語サーバーを起動できなかった: {error}"));
+            } else {
+                self.status_message =
+                    Some("言語サーバーは起動中。少し待ってからもう一度試して".into());
+            }
+            cx.notify();
+            return;
+        };
+        let capability = if method.ends_with("definition") {
+            "definitionProvider"
+        } else {
+            "implementationProvider"
+        };
+        if !client.supports(capability) {
+            self.status_message = Some(format!(
+                "この言語サーバーは{kind_label}ジャンプに対応していない"
+            ));
+            cx.notify();
+            return;
+        }
+        let text = self.editor.read(cx).text().to_string();
+        let cursor = self.editor.read(cx).cursor_position();
+        let offset = char_position_to_offset(&text, cursor.line, cursor.character);
+        let origin = (path.clone(), cursor);
+        let method_owned = method.to_string();
+        let label = kind_label.to_string();
+        let task =
+            cx.background_spawn(async move { client.goto(&method_owned, &path, &text, offset) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.apply_goto(result, &label, origin, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// ジャンプ結果の反映：0件はメッセージ、1件は即ジャンプ、複数は候補リストを出す。
+    fn apply_goto(
+        &mut self,
+        result: Result<Vec<lsp::LspLocation>, String>,
+        kind_label: &str,
+        origin: (PathBuf, Position),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Err(error) => {
+                self.status_message = Some(format!("ジャンプできなかった: {error}"));
+            }
+            Ok(locations) if locations.is_empty() => {
+                self.status_message = Some(format!("{kind_label}が見つからなかった"));
+            }
+            Ok(mut locations) if locations.len() == 1 => {
+                let location = locations.remove(0);
+                self.jump_to_location(&location, origin, window, cx);
+            }
+            Ok(locations) => {
+                let mut candidates = Vec::new();
+                for location in &locations {
+                    if let Some(position) = self.location_position(location, cx) {
+                        let label = format!(
+                            "{}:{}",
+                            location
+                                .path
+                                .strip_prefix(self.project.as_deref().unwrap_or(&location.path))
+                                .unwrap_or(&location.path)
+                                .to_string_lossy(),
+                            location.line + 1
+                        );
+                        candidates.push(GotoCandidate {
+                            path: location.path.clone(),
+                            position,
+                            label,
+                        });
+                    }
+                }
+                if candidates.is_empty() {
+                    self.status_message = Some(format!("{kind_label}が見つからなかった"));
+                } else {
+                    self.goto_candidates = Some((candidates, origin));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// LSP の位置（列は UTF-16）をエディタの位置（列は文字数）へ変換する。
+    fn location_position(&self, location: &lsp::LspLocation, cx: &App) -> Option<Position> {
+        let text = if self.editing_path.as_deref() == Some(location.path.as_path()) {
+            self.editor.read(cx).text().to_string()
+        } else {
+            std::fs::read_to_string(&location.path).ok()?
+        };
+        let offset = lsp::position_to_offset(&text, location.line, location.character);
+        Some(offset_to_char_position(&text, offset))
+    }
+
+    /// ジャンプ実行。履歴にジャンプ元を積み、対象を開く（未保存時は確認バーを経由）。
+    fn jump_to_location(
+        &mut self,
+        location: &lsp::LspLocation,
+        origin: (PathBuf, Position),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(position) = self.location_position(location, cx) else {
+            return;
+        };
+        if origin.0 != location.path
+            || origin.1.line != position.line
+            || origin.1.character != position.character
+        {
+            self.nav_back.push(origin);
+            self.nav_forward.clear();
+        }
+        self.goto_candidates = None;
+        self.jump_to(location.path.clone(), position, window, cx);
+    }
+
+    /// 履歴を積まずに (path, position) へ移動する。
+    fn jump_to(
+        &mut self,
+        path: PathBuf,
+        position: Position,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_path.as_deref() == Some(path.as_path()) {
+            self.diff_target = None;
+            self.diff_text = None;
+            self.editor_open = true;
+            self.editor.update(cx, |state, cx| {
+                state.set_cursor_position(position, window, cx);
+            });
+        } else if self.dirty {
+            self.pending_path = Some(path);
+            self.pending_position = Some(position);
+        } else {
+            self.open_path_at(path, Some(position), window, cx);
+        }
+        cx.notify();
+    }
+
+    fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, position)) = self.nav_back.last().cloned() else {
+            return;
+        };
+        if self.dirty && self.editing_path.as_deref() != Some(path.as_path()) {
+            self.pending_path = Some(path);
+            self.pending_position = Some(position);
+            cx.notify();
+            return;
+        }
+        self.nav_back.pop();
+        if let Some(current) = self.editing_path.clone() {
+            let cursor = self.editor.read(cx).cursor_position();
+            self.nav_forward.push((current, cursor));
+        }
+        self.goto_candidates = None;
+        self.jump_to(path, position, window, cx);
+    }
+
+    fn navigate_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, position)) = self.nav_forward.last().cloned() else {
+            return;
+        };
+        if self.dirty && self.editing_path.as_deref() != Some(path.as_path()) {
+            self.pending_path = Some(path);
+            self.pending_position = Some(position);
+            cx.notify();
+            return;
+        }
+        self.nav_forward.pop();
+        if let Some(current) = self.editing_path.clone() {
+            let cursor = self.editor.read(cx).cursor_position();
+            self.nav_back.push((current, cursor));
+        }
+        self.goto_candidates = None;
+        self.jump_to(path, position, window, cx);
     }
 
     /// 検索結果をクリックしたとき：該当ファイルを開いて行へジャンプする。
@@ -1055,6 +1413,22 @@ impl Workbench {
         header = header
             .child(div().flex_1())
             .child(
+                Button::new("goto-definition")
+                    .ghost()
+                    .small()
+                    .label("定義")
+                    .on_click(cx.listener(|this, _, window, cx| this.goto_definition(window, cx))),
+            )
+            .child(
+                Button::new("goto-implementation")
+                    .ghost()
+                    .small()
+                    .label("実装")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.goto_implementation(window, cx)),
+                    ),
+            )
+            .child(
                 Button::new("save-file")
                     .ghost()
                     .small()
@@ -1127,6 +1501,41 @@ impl Workbench {
                             })),
                     ),
             );
+        }
+        if let Some((candidates, _)) = &self.goto_candidates {
+            let mut list = div()
+                .id("goto-candidates-scroll")
+                .v_flex()
+                .flex_shrink_0()
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .py_1()
+                .bg(rgb(SURFACE))
+                .border_b_1()
+                .border_color(rgb(LINE));
+            for (index, candidate) in candidates.iter().enumerate() {
+                list = list.child(
+                    div()
+                        .id(("goto-candidate", index as u64))
+                        .px_4()
+                        .py(px(5.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .hover(|style| style.bg(rgb(SIDEBAR)))
+                        .child(candidate.label.clone())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some((candidates, origin)) = this.goto_candidates.take() {
+                                if let Some(candidate) = candidates.into_iter().nth(index) {
+                                    // 候補の位置は変換済み（文字数ベース）なので直接開く。
+                                    this.nav_back.push(origin);
+                                    this.nav_forward.clear();
+                                    this.jump_to(candidate.path, candidate.position, window, cx);
+                                }
+                            }
+                        })),
+                );
+            }
+            panel = panel.child(list);
         }
         panel.child(
             div().flex_1().min_h_0().child(
@@ -1671,6 +2080,20 @@ impl Render for Workbench {
             .on_action(
                 cx.listener(|this, _: &ToggleEditor, window, cx| this.toggle_editor(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &GotoDefinition, window, cx| {
+                    this.goto_definition(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &GotoImplementation, window, cx| {
+                this.goto_implementation(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &NavigateBack, window, cx| this.navigate_back(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
+                this.navigate_forward(window, cx)
+            }))
             .bg(rgb(CANVAS))
             .text_color(rgb(TEXT))
             .font_family(".AppleSystemUIFont")
@@ -1826,6 +2249,10 @@ fn main() {
                 KeyBinding::new("ctrl-s", SaveFile, None),
                 KeyBinding::new("cmd-e", ToggleEditor, None),
                 KeyBinding::new("ctrl-e", ToggleEditor, None),
+                KeyBinding::new("f12", GotoDefinition, None),
+                KeyBinding::new("ctrl-f12", GotoImplementation, None),
+                KeyBinding::new("alt-left", NavigateBack, None),
+                KeyBinding::new("alt-right", NavigateForward, None),
             ]);
             Theme::change(ThemeMode::Dark, None, cx);
             Theme::update(cx, |theme| {
