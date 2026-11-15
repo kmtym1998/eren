@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
@@ -48,6 +48,9 @@ impl EventListener for WakeListener {
     }
 }
 
+/// 保持するスクロールバック行数。
+const SCROLLBACK: usize = 10_000;
+
 struct TermSize {
     cols: usize,
     lines: usize,
@@ -55,7 +58,7 @@ struct TermSize {
 
 impl Dimensions for TermSize {
     fn total_lines(&self) -> usize {
-        self.lines
+        self.lines + SCROLLBACK
     }
     fn screen_lines(&self) -> usize {
         self.lines
@@ -83,6 +86,8 @@ pub struct Line {
 pub struct Snapshot {
     pub lines: Vec<Line>,
     pub default_bg: u32,
+    /// 履歴を遡っている行数（0 = 最下部）。
+    pub display_offset: usize,
 }
 
 pub struct TerminalSession {
@@ -134,7 +139,17 @@ impl TerminalSession {
     }
 
     pub fn write(&self, bytes: &[u8]) {
+        // 入力時は最下部へ戻す（一般的なターミナルの挙動）。
+        self.term.lock().scroll_display(Scroll::Bottom);
         let _ = self.sender.send(Msg::Input(Cow::Owned(bytes.to_vec())));
+    }
+
+    /// 履歴スクロール。正で過去方向、負で最新方向へ。
+    pub fn scroll(&self, delta_lines: i32) {
+        if delta_lines != 0 {
+            self.term.lock().scroll_display(Scroll::Delta(delta_lines));
+            self.wake.store(true, Ordering::SeqCst);
+        }
     }
 
     pub fn shutdown(&self) {
@@ -166,7 +181,8 @@ impl TerminalSession {
         let default_fg = colors[NamedColor::Foreground].unwrap_or(DEFAULT_FG);
         let default_bg = colors[NamedColor::Background].unwrap_or(DEFAULT_BG);
         let show_cursor = content.mode.contains(TermMode::SHOW_CURSOR)
-            && content.cursor.shape == CursorShape::Block;
+            && content.cursor.shape == CursorShape::Block
+            && content.display_offset == 0;
         let cursor_point = content.cursor.point;
 
         let resolve = |color: Color, is_fg: bool| -> Rgb {
@@ -251,6 +267,7 @@ impl TerminalSession {
         Snapshot {
             lines,
             default_bg: default_bg_u32,
+            display_offset: content.display_offset,
         }
     }
 }

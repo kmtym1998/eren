@@ -758,6 +758,23 @@ impl Workbench {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Shift+PageUp / PageDown は履歴スクロールに使う（シェルへは送らない）。
+        if event.keystroke.modifiers.shift {
+            let page = match event.keystroke.key.as_str() {
+                "pageup" => Some(1),
+                "pagedown" => Some(-1),
+                _ => None,
+            };
+            if let Some(direction) = page {
+                if let Some(session) = &self.terminal {
+                    let rows = session.rows as i32;
+                    session.scroll(direction * rows);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
+        }
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
             if let Some(session) = &self.terminal {
                 session.write(&bytes);
@@ -809,6 +826,7 @@ impl Workbench {
 
         let snapshot = session.snapshot();
         let default_bg = snapshot.default_bg;
+        let scrolled_up = snapshot.display_offset > 0;
         let weak = cx.entity().downgrade();
         let body = div()
             .relative()
@@ -826,12 +844,25 @@ impl Workbench {
                     this.terminal_focus.focus(window, cx);
                 }),
             )
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                let lines = match event.delta {
+                    ScrollDelta::Lines(point) => point.y as i32,
+                    ScrollDelta::Pixels(point) => (point.y / px(terminal::CELL_H)) as i32,
+                };
+                if let Some(session) = &this.terminal {
+                    session.scroll(lines);
+                }
+                cx.notify();
+            }))
             .child(
                 div().absolute().inset_0().child(
                     canvas(
                         move |bounds, _, cx| {
-                            let cols = (bounds.size.width / px(terminal::CELL_W)).floor() as usize;
-                            let rows = (bounds.size.height / px(terminal::CELL_H)).floor() as usize;
+                            // 表示側の padding（上下左右 8px ずつ）を差し引いて数える。
+                            let cols = ((bounds.size.width - px(16.)) / px(terminal::CELL_W))
+                                .floor() as usize;
+                            let rows = ((bounds.size.height - px(16.)) / px(terminal::CELL_H))
+                                .floor() as usize;
                             if cols >= 2 && rows >= 1 {
                                 let _ = weak
                                     .update(cx, |this, cx| this.terminal_resize(cols, rows, cx));
@@ -869,6 +900,24 @@ impl Workbench {
                             }))
                     })),
             );
+        let mut body = body;
+        if scrolled_up {
+            body = body.child(
+                div()
+                    .absolute()
+                    .bottom_2()
+                    .right_3()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .bg(rgb(SURFACE))
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("履歴を表示中（キー入力で最新の位置へ戻る）"),
+            );
+        }
         panel.child(body)
     }
 
