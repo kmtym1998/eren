@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::button::*;
@@ -14,9 +15,121 @@ const TEXT: u32 = 0xe2e7ef;
 const MUTED: u32 = 0x98a3b4;
 const ACCENT: u32 = 0xb4c9ee;
 
+/// ファイルツリーの1エントリ。フォルダの children は開いたときに遅延で読む。
+struct TreeEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    children: Option<Vec<TreeEntry>>,
+}
+
+/// ツリーで見えている1行（描画用にフラット化したもの）。
+struct TreeRow {
+    path: PathBuf,
+    name: String,
+    depth: usize,
+    is_dir: bool,
+    expanded: bool,
+}
+
+/// 開いているファイルの中身（読み取り専用ビューア用）。
+struct OpenFile {
+    path: PathBuf,
+    lines: Vec<String>,
+    truncated: bool,
+}
+
+const MAX_LINES: usize = 5000;
+const MAX_FILE_BYTES: u64 = 2_000_000;
+/// ツリーに出さないフォルダ。
+const SKIPPED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+
+fn read_dir_entries(dir: &Path) -> Vec<TreeEntry> {
+    let mut entries: Vec<TreeEntry> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = file_type.is_dir();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_dir && SKIPPED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            entries.push(TreeEntry {
+                path,
+                name,
+                is_dir,
+                children: None,
+            });
+        }
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    entries
+}
+
+fn flatten_tree(
+    entries: &[TreeEntry],
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    rows: &mut Vec<TreeRow>,
+) {
+    for entry in entries {
+        let is_expanded = entry.is_dir && expanded.contains(&entry.path);
+        rows.push(TreeRow {
+            path: entry.path.clone(),
+            name: entry.name.clone(),
+            depth,
+            is_dir: entry.is_dir,
+            expanded: is_expanded,
+        });
+        if is_expanded {
+            if let Some(children) = &entry.children {
+                flatten_tree(children, depth + 1, expanded, rows);
+            }
+        }
+    }
+}
+
+/// そのフォルダの children を未読込なら読み込む。
+fn ensure_children(entries: &mut [TreeEntry], dir: &Path) -> bool {
+    for entry in entries.iter_mut() {
+        if entry.path == dir {
+            if entry.is_dir && entry.children.is_none() {
+                entry.children = Some(read_dir_entries(&entry.path));
+            }
+            return true;
+        }
+        if let Some(children) = &mut entry.children {
+            if ensure_children(children, dir) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// .git/HEAD からブランチ名を読む（worktree 等で読めなければ None）。
+fn git_branch(root: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
+    let head = head.trim();
+    head.strip_prefix("ref: refs/heads/")
+        .map(|name| name.to_string())
+}
+
 pub struct Workbench {
     project: Option<PathBuf>,
     picker_error: Option<String>,
+    tree: Vec<TreeEntry>,
+    expanded: HashSet<PathBuf>,
+    branch: Option<String>,
+    open_file: Option<OpenFile>,
+    file_error: Option<String>,
 }
 
 fn icon(name: Glyph) -> Icon {
@@ -34,7 +147,7 @@ fn section_heading(title: &'static str) -> Div {
         .child(title)
 }
 
-fn panel_header(name: &'static str, glyph: Glyph) -> Div {
+fn panel_header(name: impl Into<SharedString>, glyph: Glyph) -> Div {
     div()
         .h_flex()
         .h(px(46.))
@@ -46,7 +159,7 @@ fn panel_header(name: &'static str, glyph: Glyph) -> Div {
         .border_color(rgb(LINE))
         .text_color(rgb(MUTED))
         .child(icon(glyph))
-        .child(div().text_color(rgb(TEXT)).child(name))
+        .child(div().text_color(rgb(TEXT)).child(name.into()))
 }
 
 impl Workbench {
@@ -54,6 +167,77 @@ impl Workbench {
         Self {
             project: None,
             picker_error: None,
+            tree: Vec::new(),
+            expanded: HashSet::new(),
+            branch: None,
+            open_file: None,
+            file_error: None,
+        }
+    }
+
+    fn load_project(&mut self, root: PathBuf) {
+        self.tree = read_dir_entries(&root);
+        self.branch = git_branch(&root);
+        self.expanded.clear();
+        self.open_file = None;
+        self.file_error = None;
+        self.project = Some(root);
+    }
+
+    fn on_tree_click(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+        if is_dir {
+            if self.expanded.contains(&path) {
+                self.expanded.remove(&path);
+            } else {
+                ensure_children(&mut self.tree, &path);
+                self.expanded.insert(path);
+            }
+        } else {
+            self.open_path(path);
+        }
+        cx.notify();
+    }
+
+    fn open_path(&mut self, path: PathBuf) {
+        self.file_error = None;
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
+                self.file_error = Some("ファイルが大きいため表示できない（上限 2 MB）。".into());
+                self.open_file = None;
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                self.file_error = Some("ファイルを開けなかった。".into());
+                self.open_file = None;
+                return;
+            }
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if bytes.iter().take(8192).any(|b| *b == 0) {
+                    self.file_error = Some("バイナリファイルは表示できない。".into());
+                    self.open_file = None;
+                    return;
+                }
+                let text = String::from_utf8_lossy(&bytes);
+                let mut lines: Vec<String> = text
+                    .lines()
+                    .take(MAX_LINES + 1)
+                    .map(|line| line.replace('\t', "    "))
+                    .collect();
+                let truncated = lines.len() > MAX_LINES;
+                lines.truncate(MAX_LINES);
+                self.open_file = Some(OpenFile {
+                    path,
+                    lines,
+                    truncated,
+                });
+            }
+            Err(_) => {
+                self.file_error = Some("ファイルを読み込めなかった。".into());
+                self.open_file = None;
+            }
         }
     }
 
@@ -69,7 +253,9 @@ impl Workbench {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => {
-                        this.project = paths.into_iter().next();
+                        if let Some(root) = paths.into_iter().next() {
+                            this.load_project(root);
+                        }
                         this.picker_error = None;
                     }
                     Ok(Ok(None)) => {}
@@ -156,16 +342,220 @@ impl Workbench {
             )
     }
 
+    fn tree_panel(&self, cx: &Context<Self>) -> Div {
+        let mut rows: Vec<TreeRow> = Vec::new();
+        flatten_tree(&self.tree, 0, &self.expanded, &mut rows);
+
+        let mut list = div()
+            .id("tree-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .py_2();
+        if rows.is_empty() {
+            list = list.child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("表示するファイルがない"),
+            );
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let selected = self
+                .open_file
+                .as_ref()
+                .is_some_and(|file| file.path == row.path);
+            let glyph = if row.is_dir {
+                if row.expanded {
+                    Glyph::FolderOpen
+                } else {
+                    Glyph::Folder
+                }
+            } else {
+                Glyph::File
+            };
+            let mut item = div()
+                .id(("tree-row", index as u64))
+                .h_flex()
+                .items_center()
+                .gap_1()
+                .h(px(26.))
+                .pl(px(8. + row.depth as f32 * 14.))
+                .pr_2()
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(SURFACE)))
+                .child(if row.is_dir {
+                    icon(if row.expanded {
+                        Glyph::ChevronDown
+                    } else {
+                        Glyph::ChevronRight
+                    })
+                    .size(px(12.))
+                    .text_color(rgb(MUTED))
+                } else {
+                    Icon::new(Glyph::ChevronRight)
+                        .size(px(12.))
+                        .text_color(rgb(CANVAS))
+                })
+                .child(icon(glyph).size(px(14.)).text_color(if row.is_dir {
+                    rgb(ACCENT)
+                } else {
+                    rgb(MUTED)
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(row.name.clone()),
+                );
+            if selected {
+                item = item.bg(rgb(SURFACE)).text_color(rgb(ACCENT));
+            }
+            let path = row.path.clone();
+            let is_dir = row.is_dir;
+            list = list.child(item.on_click(cx.listener(move |this, _, _, cx| {
+                this.on_tree_click(path.clone(), is_dir, cx);
+            })));
+        }
+
+        let mut header = panel_header("ファイル", Glyph::Folder);
+        if let Some(branch) = &self.branch {
+            header = header.child(div().flex_1()).child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .child(icon(Glyph::GitBranch).size(px(12.)))
+                    .child(branch.clone()),
+            );
+        }
+
+        div()
+            .v_flex()
+            .w(px(264.))
+            .flex_shrink_0()
+            .h_full()
+            .bg(rgb(SIDEBAR))
+            .border_r_1()
+            .border_color(rgb(LINE))
+            .child(header)
+            .child(list)
+    }
+
+    fn viewer(&self) -> Div {
+        let mut panel = div().v_flex().flex_1().min_w_0().h_full();
+
+        match (&self.open_file, &self.file_error) {
+            (Some(file), _) => {
+                let title = file
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut code = div()
+                    .id("code-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .overflow_x_scroll()
+                    .py_3()
+                    .font_family("Menlo")
+                    .text_size(px(12.));
+                for (index, line) in file.lines.iter().enumerate() {
+                    code = code.child(
+                        div()
+                            .h_flex()
+                            .flex_none()
+                            .child(
+                                div()
+                                    .w(px(52.))
+                                    .flex_shrink_0()
+                                    .pr_3()
+                                    .text_color(rgb(0x5b6575))
+                                    .child(format!("{}", index + 1)),
+                            )
+                            .child(div().whitespace_nowrap().child(if line.is_empty() {
+                                " ".to_string()
+                            } else {
+                                line.clone()
+                            })),
+                    );
+                }
+                if file.truncated {
+                    code = code.child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .text_color(rgb(MUTED))
+                            .child(format!("… 先頭 {} 行のみ表示", MAX_LINES)),
+                    );
+                }
+                panel = panel.child(panel_header(title, Glyph::File)).child(code);
+            }
+            (None, Some(error)) => {
+                panel = panel.child(panel_header("ビューア", Glyph::File)).child(
+                    div()
+                        .flex_1()
+                        .v_flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().text_color(rgb(0xe9b4aa)).child(error.clone())),
+                );
+            }
+            (None, None) => {
+                panel = panel.child(panel_header("ビューア", Glyph::File)).child(
+                    div()
+                        .flex_1()
+                        .v_flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_color(rgb(MUTED))
+                                .child("左のツリーでファイルを選ぶと、ここに表示する"),
+                        ),
+                );
+            }
+        }
+        panel
+    }
+
     fn workspace(&self, cx: &Context<Self>) -> Div {
-        let title = if self.project.is_some() {
-            "プロジェクトを開いた"
-        } else {
-            "ここから、作業を始めよう"
-        };
-        let detail = match &self.project {
-            Some(path) => path.to_string_lossy().into_owned(),
-            None => "ローカルのプロジェクトを、このワークスペースに。".into(),
-        };
+        if self.project.is_some() {
+            return div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(panel_header("作業領域", Glyph::CodeXml))
+                .child(
+                    div()
+                        .h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.tree_panel(cx))
+                        .child(self.viewer()),
+                )
+                .child(
+                    div()
+                        .h(px(44.))
+                        .h_flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(icon(Glyph::LockKeyhole))
+                        .child("読み取り専用ビューア（編集はできない）"),
+                );
+        }
+        let title = "ここから、作業を始めよう";
+        let detail = "ローカルのプロジェクトを、このワークスペースに。".to_string();
         let mut empty = div()
             .v_flex()
             .items_center()
@@ -201,24 +591,12 @@ impl Workbench {
                     Button::new("open-project")
                         .primary()
                         .icon(Glyph::FolderOpen)
-                        .label(if self.project.is_some() {
-                            "別のフォルダを開く"
-                        } else {
-                            "プロジェクトを開く"
-                        })
+                        .label("プロジェクトを開く")
                         .on_click(cx.listener(|this, _, _, cx| this.open_project(cx))),
                 ),
             );
         if let Some(error) = &self.picker_error {
             empty = empty.child(div().text_color(rgb(0xe9b4aa)).child(error.clone()));
-        }
-        if self.project.is_some() {
-            empty = empty.child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child("ファイルビューアと Git 差分は、これから追加する。"),
-            );
         }
         div()
             .v_flex()
@@ -369,14 +747,19 @@ fn main() {
             "eren {}: コーディングエージェント用ネイティブワークスペース",
             env!("CARGO_PKG_VERSION")
         );
-        println!("使い方: eren [--version|--help]");
-        println!("引数なしで GUI を起動する。");
+        println!("使い方: eren [--version|--help] [プロジェクトのフォルダ]");
+        println!("引数なしで GUI を起動する。フォルダを渡すとそのプロジェクトを開く。");
         return;
     }
+    let initial_project = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir());
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
-        .run(|cx| {
+        .run(move |cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             Theme::update(cx, |theme| {
@@ -392,7 +775,15 @@ fn main() {
                     ..TitleBar::window_options()
                 },
                 cx,
-                |_, cx| cx.new(|_| Workbench::new()),
+                move |_, cx| {
+                    cx.new(|_| {
+                        let mut workbench = Workbench::new();
+                        if let Some(root) = initial_project {
+                            workbench.load_project(root);
+                        }
+                        workbench
+                    })
+                },
             )
             .expect("ウィンドウを開けなかった");
             cx.activate(true);

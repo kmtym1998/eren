@@ -2,7 +2,7 @@
 
 Sirio / Herdr 風の、coding agent のためのネイティブ・ワークスペースを新規に作る。
 Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15 決定）。
-リポジトリは kmtym1998/eren（private）。
+リポジトリは kmtym1998/eren（public — 2026-11-15 に Homebrew 配布のためユーザーが public 化）。
 
 ## 確定した方針
 
@@ -13,15 +13,15 @@ Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15
   - 飛ぶ系は全部「位置 → Location 群」で同型なので、`goto(kind, position)` に共通化する
   - 複数候補はピッカー、ナビゲーション履歴（戻る / 進む）を必須とする
   - 対応はサーバーの capability を見て出し分ける
-- 同期は読み取り専用前提で全文同期のみ（ファイル変更時は開き直し）。補完・rename・整形は対象外
+- ファイル編集も対象にする（2026-11-15 ユーザー要望で、当初の読み取り専用前提から変更）。LSP 同期は全文同期のみ（外部変更時は開き直し）。補完・rename・整形は対象外
 - 言語サーバーは最初 rust-analyzer のみ、次に TypeScript を足す
 
 ## MVP スコープ
 
 ### Phase 1（ビューア核）
 - [ ] ウィンドウ + 3ペイン骨格（左：プロジェクト/agent、中央：ビューア、右：Changes）← 土台は作成済み
-- [ ] プロジェクトを開く（フォルダ選択 → ファイルツリー表示、git worktree / ブランチ名）
-- [ ] ファイルツリー（gpui-component Tree）→ 読み取り専用エディタ（EditorState、tree-sitter ハイライト）
+- [x] プロジェクトを開く（フォルダ選択 → ファイルツリー表示、`.git/HEAD` からブランチ名表示。CLI 引数でフォルダを渡しても開ける）※ worktree 一覧は未
+- [ ] ファイルツリー → コードビューア／エディタ（ツリーとプレーンテキスト表示＋行番号は実装済み 2026-11-15。残りは EditorState 化＝そのまま編集して保存できるようにすること、と tree-sitter ハイライト）
 - [ ] Changes：git status の差分ツリー + Diff 表示（split / unified）
 - [ ] 横断検索：ripgrep 系 crate（grep-searcher + ignore）で結果一覧 → 行ジャンプ
 
