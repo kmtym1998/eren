@@ -1,0 +1,9 @@
+[package]
+name = "eren"
+version = "0.1.0"
+edition = "2021"
+description = "A Sirio/Herdr-like native workspace for coding agents: project sidebar, code viewer with LSP jumps, diffs and (later) terminals."
+license = "MIT"
+
+[dependencies]
+gpui-kit = "0.9"
