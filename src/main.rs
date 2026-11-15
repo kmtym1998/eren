@@ -127,6 +127,8 @@ pub struct Workbench {
     editor: Entity<EditorState>,
     editing_path: Option<PathBuf>,
     dirty: bool,
+    /// 未保存のまま切り替えようとした先のファイル。確認バーで決着するまで開かない。
+    pending_path: Option<PathBuf>,
     file_error: Option<String>,
     status_message: Option<String>,
     _editor_subscription: Subscription,
@@ -190,6 +192,7 @@ impl Workbench {
             editor,
             editing_path: None,
             dirty: false,
+            pending_path: None,
             file_error: None,
             status_message: None,
             _editor_subscription: subscription,
@@ -202,6 +205,7 @@ impl Workbench {
         self.expanded.clear();
         self.editing_path = None;
         self.dirty = false;
+        self.pending_path = None;
         self.file_error = None;
         self.status_message = None;
         self.project = Some(root);
@@ -222,6 +226,17 @@ impl Workbench {
                 self.expanded.insert(path);
             }
         } else {
+            // 開いているファイル自身のクリックは再読込しない（未保存の編集を守る）。
+            if self.editing_path.as_ref() == Some(&path) {
+                cx.notify();
+                return;
+            }
+            // 未保存のまま別ファイルへ行くときは、すぐ開かず確認バーを出す。
+            if self.dirty {
+                self.pending_path = Some(path);
+                cx.notify();
+                return;
+            }
             self.open_path(path, window, cx);
         }
         cx.notify();
@@ -230,6 +245,7 @@ impl Workbench {
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.file_error = None;
         self.status_message = None;
+        self.pending_path = None;
         match std::fs::metadata(&path) {
             Ok(meta) if meta.len() > MAX_FILE_BYTES => {
                 self.file_error = Some("ファイルが大きいため開けない（上限 2 MB）。".into());
@@ -272,22 +288,51 @@ impl Workbench {
         focus_handle.focus(window, cx);
     }
 
-    fn save_file(&mut self, cx: &mut Context<Self>) {
+    /// 編集中のファイルを保存する。保存不要・保存成功なら true、失敗なら false。
+    fn save_current(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(path) = self.editing_path.clone() else {
-            return;
+            return false;
         };
         if !self.dirty {
-            return;
+            return true;
         }
         let text = self.editor.read(cx).text().to_string();
         match std::fs::write(&path, text) {
             Ok(()) => {
                 self.dirty = false;
                 self.status_message = Some("保存した".into());
+                cx.notify();
+                true
             }
             Err(error) => {
                 self.status_message = Some(format!("保存できなかった: {error}"));
+                cx.notify();
+                false
             }
+        }
+    }
+
+    fn save_file(&mut self, cx: &mut Context<Self>) {
+        self.save_current(cx);
+    }
+
+    /// 確認バーで「保存して開く」が選ばれたとき。保存に成功したら待機中のファイルを開く。
+    fn save_and_open_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_path.take() else {
+            return;
+        };
+        if self.save_current(cx) {
+            self.open_path(pending, window, cx);
+        } else {
+            self.pending_path = Some(pending);
+        }
+        cx.notify();
+    }
+
+    /// 確認バーで「破棄して開く」が選ばれたとき。未保存の編集は捨てて開く。
+    fn discard_and_open_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_path.take() {
+            self.open_path(pending, window, cx);
         }
         cx.notify();
     }
@@ -550,7 +595,59 @@ impl Workbench {
                 .on_click(cx.listener(|this, _, _, cx| this.save_file(cx))),
         );
 
-        panel.child(header).child(
+        let mut panel = panel.child(header);
+        if let Some(_pending) = &self.pending_path {
+            panel = panel.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .flex_shrink_0()
+                    .bg(rgb(0x3a2e22))
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child("未保存の変更があります"),
+                    )
+                    .child(
+                        Button::new("confirm-save-open")
+                            .primary()
+                            .small()
+                            .label("保存して開く")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_and_open_pending(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-discard-open")
+                            .ghost()
+                            .small()
+                            .label("破棄して開く")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.discard_and_open_pending(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-cancel")
+                            .ghost()
+                            .small()
+                            .label("キャンセル")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pending_path = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        panel.child(
             div().flex_1().min_h_0().child(
                 Editor::new(&self.editor)
                     .bordered(false)
