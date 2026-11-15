@@ -3,8 +3,12 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::button::*;
-use gpui_kit::component::{Icon, Sizable, StyledExt, Theme, ThemeMode, TitleBar};
+use gpui_kit::component::highlighter::Language;
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, TabSize};
+use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
+
+actions!(eren, [SaveFile]);
 
 // ペインの階層を背景色で分け、選択と操作にだけ青を使う。
 const CANVAS: u32 = 0x1b1e24;
@@ -32,14 +36,6 @@ struct TreeRow {
     expanded: bool,
 }
 
-/// 開いているファイルの中身（読み取り専用ビューア用）。
-struct OpenFile {
-    path: PathBuf,
-    lines: Vec<String>,
-    truncated: bool,
-}
-
-const MAX_LINES: usize = 5000;
 const MAX_FILE_BYTES: u64 = 2_000_000;
 /// ツリーに出さないフォルダ。
 const SKIPPED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
@@ -128,8 +124,12 @@ pub struct Workbench {
     tree: Vec<TreeEntry>,
     expanded: HashSet<PathBuf>,
     branch: Option<String>,
-    open_file: Option<OpenFile>,
+    editor: Entity<EditorState>,
+    editing_path: Option<PathBuf>,
+    dirty: bool,
     file_error: Option<String>,
+    status_message: Option<String>,
+    _editor_subscription: Subscription,
 }
 
 fn icon(name: Glyph) -> Icon {
@@ -163,15 +163,36 @@ fn panel_header(name: impl Into<SharedString>, glyph: Glyph) -> Div {
 }
 
 impl Workbench {
-    fn new() -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .line_number(true)
+                .indent_guides(true)
+                .tab_size(TabSize {
+                    tab_size: 4,
+                    hard_tabs: false,
+                })
+                .soft_wrap(false)
+                .placeholder("ファイルを選ぶと、ここで編集できる")
+        });
+        let subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && !this.dirty {
+                this.dirty = true;
+                cx.notify();
+            }
+        });
         Self {
             project: None,
             picker_error: None,
             tree: Vec::new(),
             expanded: HashSet::new(),
             branch: None,
-            open_file: None,
+            editor,
+            editing_path: None,
+            dirty: false,
             file_error: None,
+            status_message: None,
+            _editor_subscription: subscription,
         }
     }
 
@@ -179,12 +200,20 @@ impl Workbench {
         self.tree = read_dir_entries(&root);
         self.branch = git_branch(&root);
         self.expanded.clear();
-        self.open_file = None;
+        self.editing_path = None;
+        self.dirty = false;
         self.file_error = None;
+        self.status_message = None;
         self.project = Some(root);
     }
 
-    fn on_tree_click(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+    fn on_tree_click(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if is_dir {
             if self.expanded.contains(&path) {
                 self.expanded.remove(&path);
@@ -193,52 +222,74 @@ impl Workbench {
                 self.expanded.insert(path);
             }
         } else {
-            self.open_path(path);
+            self.open_path(path, window, cx);
         }
         cx.notify();
     }
 
-    fn open_path(&mut self, path: PathBuf) {
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.file_error = None;
+        self.status_message = None;
         match std::fs::metadata(&path) {
             Ok(meta) if meta.len() > MAX_FILE_BYTES => {
-                self.file_error = Some("ファイルが大きいため表示できない（上限 2 MB）。".into());
-                self.open_file = None;
+                self.file_error = Some("ファイルが大きいため開けない（上限 2 MB）。".into());
+                self.editing_path = None;
                 return;
             }
             Ok(_) => {}
             Err(_) => {
                 self.file_error = Some("ファイルを開けなかった。".into());
-                self.open_file = None;
+                self.editing_path = None;
                 return;
             }
         }
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                if bytes.iter().take(8192).any(|b| *b == 0) {
-                    self.file_error = Some("バイナリファイルは表示できない。".into());
-                    self.open_file = None;
-                    return;
-                }
-                let text = String::from_utf8_lossy(&bytes);
-                let mut lines: Vec<String> = text
-                    .lines()
-                    .take(MAX_LINES + 1)
-                    .map(|line| line.replace('\t', "    "))
-                    .collect();
-                let truncated = lines.len() > MAX_LINES;
-                lines.truncate(MAX_LINES);
-                self.open_file = Some(OpenFile {
-                    path,
-                    lines,
-                    truncated,
-                });
-            }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(_) => {
                 self.file_error = Some("ファイルを読み込めなかった。".into());
-                self.open_file = None;
+                self.editing_path = None;
+                return;
+            }
+        };
+        if bytes.iter().take(8192).any(|b| *b == 0) {
+            self.file_error = Some("バイナリファイルは開けない。".into());
+            self.editing_path = None;
+            return;
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let language = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| Language::from_str(ext).name().to_string())
+            .unwrap_or_else(|| "plain".to_string());
+        self.editor.update(cx, |state, cx| {
+            state.set_highlighter(language, cx);
+            state.set_value(text, window, cx);
+        });
+        self.editing_path = Some(path);
+        self.dirty = false;
+        let focus_handle = self.editor.focus_handle(cx);
+        focus_handle.focus(window, cx);
+    }
+
+    fn save_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.editing_path.clone() else {
+            return;
+        };
+        if !self.dirty {
+            return;
+        }
+        let text = self.editor.read(cx).text().to_string();
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.dirty = false;
+                self.status_message = Some("保存した".into());
+            }
+            Err(error) => {
+                self.status_message = Some(format!("保存できなかった: {error}"));
             }
         }
+        cx.notify();
     }
 
     fn open_project(&mut self, cx: &mut Context<Self>) {
@@ -364,9 +415,9 @@ impl Workbench {
         }
         for (index, row) in rows.iter().enumerate() {
             let selected = self
-                .open_file
+                .editing_path
                 .as_ref()
-                .is_some_and(|file| file.path == row.path);
+                .is_some_and(|path| path == &row.path);
             let glyph = if row.is_dir {
                 if row.expanded {
                     Glyph::FolderOpen
@@ -417,8 +468,8 @@ impl Workbench {
             }
             let path = row.path.clone();
             let is_dir = row.is_dir;
-            list = list.child(item.on_click(cx.listener(move |this, _, _, cx| {
-                this.on_tree_click(path.clone(), is_dir, cx);
+            list = list.child(item.on_click(cx.listener(move |this, _, window, cx| {
+                this.on_tree_click(path.clone(), is_dir, window, cx);
             })));
         }
 
@@ -447,82 +498,66 @@ impl Workbench {
             .child(list)
     }
 
-    fn viewer(&self) -> Div {
-        let mut panel = div().v_flex().flex_1().min_w_0().h_full();
+    fn viewer(&self, cx: &Context<Self>) -> Div {
+        let panel = div().v_flex().flex_1().min_w_0().h_full();
 
-        match (&self.open_file, &self.file_error) {
-            (Some(file), _) => {
-                let title = file
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let mut code = div()
-                    .id("code-scroll")
+        if let Some(error) = &self.file_error {
+            return panel.child(panel_header("エディタ", Glyph::File)).child(
+                div()
                     .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .overflow_x_scroll()
-                    .py_3()
-                    .font_family("Menlo")
-                    .text_size(px(12.));
-                for (index, line) in file.lines.iter().enumerate() {
-                    code = code.child(
-                        div()
-                            .h_flex()
-                            .flex_none()
-                            .child(
-                                div()
-                                    .w(px(52.))
-                                    .flex_shrink_0()
-                                    .pr_3()
-                                    .text_color(rgb(0x5b6575))
-                                    .child(format!("{}", index + 1)),
-                            )
-                            .child(div().whitespace_nowrap().child(if line.is_empty() {
-                                " ".to_string()
-                            } else {
-                                line.clone()
-                            })),
-                    );
-                }
-                if file.truncated {
-                    code = code.child(
-                        div()
-                            .px_4()
-                            .py_2()
-                            .text_color(rgb(MUTED))
-                            .child(format!("… 先頭 {} 行のみ表示", MAX_LINES)),
-                    );
-                }
-                panel = panel.child(panel_header(title, Glyph::File)).child(code);
-            }
-            (None, Some(error)) => {
-                panel = panel.child(panel_header("ビューア", Glyph::File)).child(
-                    div()
-                        .flex_1()
-                        .v_flex()
-                        .items_center()
-                        .justify_center()
-                        .child(div().text_color(rgb(0xe9b4aa)).child(error.clone())),
-                );
-            }
-            (None, None) => {
-                panel = panel.child(panel_header("ビューア", Glyph::File)).child(
-                    div()
-                        .flex_1()
-                        .v_flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_color(rgb(MUTED))
-                                .child("左のツリーでファイルを選ぶと、ここに表示する"),
-                        ),
-                );
-            }
+                    .v_flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().text_color(rgb(0xe9b4aa)).child(error.clone())),
+            );
         }
-        panel
+
+        let Some(path) = &self.editing_path else {
+            return panel.child(panel_header("エディタ", Glyph::File)).child(
+                div()
+                    .flex_1()
+                    .v_flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child("左のツリーでファイルを選ぶと、ここで編集できる"),
+                    ),
+            );
+        };
+
+        let title = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut header = panel_header(title, Glyph::File);
+        if self.dirty {
+            header = header.child(
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(rgb(0xe9b4aa))
+                    .flex_shrink_0(),
+            );
+        }
+        header = header.child(div().flex_1()).child(
+            Button::new("save-file")
+                .ghost()
+                .small()
+                .label("保存")
+                .disabled(!self.dirty)
+                .on_click(cx.listener(|this, _, _, cx| this.save_file(cx))),
+        );
+
+        panel.child(header).child(
+            div().flex_1().min_h_0().child(
+                Editor::new(&self.editor)
+                    .bordered(false)
+                    .h_full()
+                    .text_size(px(12.5)),
+            ),
+        )
     }
 
     fn workspace(&self, cx: &Context<Self>) -> Div {
@@ -539,7 +574,7 @@ impl Workbench {
                         .flex_1()
                         .min_h_0()
                         .child(self.tree_panel(cx))
-                        .child(self.viewer()),
+                        .child(self.viewer(cx)),
                 )
                 .child(
                     div()
@@ -550,8 +585,16 @@ impl Workbench {
                         .gap_2()
                         .text_size(px(11.))
                         .text_color(rgb(MUTED))
-                        .child(icon(Glyph::LockKeyhole))
-                        .child("読み取り専用ビューア（編集はできない）"),
+                        .child(icon(Glyph::PencilLine))
+                        .child(if let Some(message) = &self.status_message {
+                            message.clone()
+                        } else if self.dirty {
+                            "未保存の変更がある（Cmd+S で保存）".to_string()
+                        } else if self.editing_path.is_some() {
+                            "保存済み".to_string()
+                        } else {
+                            "ファイルを選んで編集を始める".to_string()
+                        }),
                 );
         }
         let title = "ここから、作業を始めよう";
@@ -674,6 +717,7 @@ impl Render for Workbench {
         div()
             .v_flex()
             .size_full()
+            .on_action(cx.listener(|this, _: &SaveFile, _, cx| this.save_file(cx)))
             .bg(rgb(CANVAS))
             .text_color(rgb(TEXT))
             .font_family(".AppleSystemUIFont")
@@ -761,6 +805,10 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("cmd-s", SaveFile, None),
+                KeyBinding::new("ctrl-s", SaveFile, None),
+            ]);
             Theme::change(ThemeMode::Dark, None, cx);
             Theme::update(cx, |theme| {
                 theme.primary = rgb(ACCENT).into();
@@ -775,9 +823,9 @@ fn main() {
                     ..TitleBar::window_options()
                 },
                 cx,
-                move |_, cx| {
-                    cx.new(|_| {
-                        let mut workbench = Workbench::new();
+                move |window, cx| {
+                    cx.new(|cx| {
+                        let mut workbench = Workbench::new(window, cx);
                         if let Some(root) = initial_project {
                             workbench.load_project(root);
                         }

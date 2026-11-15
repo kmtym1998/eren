@@ -21,7 +21,7 @@ Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15
 ### Phase 1（ビューア核）
 - [ ] ウィンドウ + 3ペイン骨格（左：プロジェクト/agent、中央：ビューア、右：Changes）← 土台は作成済み
 - [x] プロジェクトを開く（フォルダ選択 → ファイルツリー表示、`.git/HEAD` からブランチ名表示。CLI 引数でフォルダを渡しても開ける）※ worktree 一覧は未
-- [ ] ファイルツリー → コードビューア／エディタ（ツリーとプレーンテキスト表示＋行番号は実装済み 2026-11-15。残りは EditorState 化＝そのまま編集して保存できるようにすること、と tree-sitter ハイライト）
+- [x] ファイルツリー → コードエディタ（EditorState 化済み 2026-11-15：そのまま編集でき、保存ボタン / Cmd+S・Ctrl+S で保存、未保存はドット表示。tree-sitter ハイライトは rust / typescript / tsx / javascript / toml / markdown / css / html / bash / yaml / python + json に対応。未保存のまま別ファイルへ切り替える際の確認は今後）
 - [ ] Changes：git status の差分ツリー + Diff 表示（split / unified）
 - [ ] 横断検索：ripgrep 系 crate（grep-searcher + ignore）で結果一覧 → 行ジャンプ
 
