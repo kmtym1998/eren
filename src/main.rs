@@ -120,6 +120,35 @@ fn ensure_children(entries: &mut [TreeEntry], dir: &Path) -> bool {
     false
 }
 
+/// `git status --porcelain=v1 -z` の出力をパースする。
+/// リネーム／コピーは次の NUL 区切りが変更前パスになるため読み飛ばす。
+fn parse_porcelain(stdout: &[u8]) -> Vec<ChangedFile> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut files = Vec::new();
+    let mut entries = text.split('\0').peekable();
+    while let Some(entry) = entries.next() {
+        let mut chars = entry.chars();
+        let (Some(index_status), Some(worktree_status), Some(' ')) =
+            (chars.next(), chars.next(), chars.next())
+        else {
+            continue;
+        };
+        let path: String = chars.collect();
+        if path.is_empty() {
+            continue;
+        }
+        if matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C') {
+            entries.next();
+        }
+        files.push(ChangedFile {
+            path,
+            index_status,
+            worktree_status,
+        });
+    }
+    files
+}
+
 /// .git/HEAD からブランチ名を読む（worktree 等で読めなければ None）。
 fn git_branch(root: &Path) -> Option<String> {
     let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
@@ -148,6 +177,37 @@ pub struct Workbench {
     terminal_focus: FocusHandle,
     /// エディタ（ツリー＋編集領域）を表示しているか。既定は非表示で、ターミナルがメイン。
     editor_open: bool,
+    /// git status の変更ファイル一覧（相対パスと XY ステータス）。
+    changes: Vec<ChangedFile>,
+    changes_error: Option<String>,
+    /// diff 表示中のファイル（相対パス）とその unified diff。
+    diff_target: Option<String>,
+    diff_text: Option<String>,
+    diff_scroll: ScrollHandle,
+}
+
+/// git status --porcelain の1エントリ。
+pub struct ChangedFile {
+    path: String,
+    index_status: char,
+    worktree_status: char,
+}
+
+impl ChangedFile {
+    /// 表示用の代表ステータス文字と色。
+    fn badge(&self) -> (String, u32) {
+        let code = format!("{}{}", self.index_status, self.worktree_status);
+        let color = if code.contains('D') {
+            0xe06c5f // 削除: 赤
+        } else if code.contains('?') || code.contains('A') {
+            0x7fb069 // 追加・未追跡: 緑
+        } else if code.contains('R') {
+            0x6aa6e8 // リネーム: 青
+        } else {
+            0xe0a458 // 変更: 琥珀
+        };
+        (code, color)
+    }
 }
 
 fn icon(name: Glyph) -> Icon {
@@ -237,6 +297,11 @@ impl Workbench {
             terminal_error: None,
             terminal_focus: cx.focus_handle(),
             editor_open: false,
+            changes: Vec::new(),
+            changes_error: None,
+            diff_target: None,
+            diff_text: None,
+            diff_scroll: ScrollHandle::new(),
         }
     }
 
@@ -250,6 +315,8 @@ impl Workbench {
         self.file_error = None;
         self.status_message = None;
         self.editor_open = false;
+        self.diff_target = None;
+        self.diff_text = None;
         // ターミナルはプロジェクトのフォルダを起点に起動し直す。
         if let Some(old) = &self.terminal {
             old.shutdown();
@@ -265,6 +332,75 @@ impl Workbench {
             }
         }
         self.project = Some(root);
+        self.refresh_changes();
+    }
+
+    /// git status を読み直して変更一覧を更新する。
+    fn refresh_changes(&mut self) {
+        let Some(root) = self.project.clone() else {
+            return;
+        };
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+            .current_dir(&root)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                self.changes_error = None;
+                self.changes = parse_porcelain(&out.stdout);
+            }
+            Ok(out) => {
+                self.changes = Vec::new();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                self.changes_error = Some(if stderr.contains("not a git repository") {
+                    "Git リポジトリではないため、変更は表示できない".to_string()
+                } else {
+                    "git status を実行できなかった".to_string()
+                });
+            }
+            Err(_) => {
+                self.changes = Vec::new();
+                self.changes_error = Some("git コマンドが見つからない".to_string());
+            }
+        }
+    }
+
+    /// 変更ファイルの diff を開く（エディタ領域に表示する）。
+    fn open_diff(&mut self, file: &ChangedFile, cx: &mut Context<Self>) {
+        let Some(root) = self.project.clone() else {
+            return;
+        };
+        let untracked = file.index_status == '?' && file.worktree_status == '?';
+        let output = if untracked {
+            // 未追跡ファイルは /dev/null との diff で全行追加として見せる。
+            std::process::Command::new("git")
+                .args(["diff", "--no-index", "--", "/dev/null", &file.path])
+                .current_dir(&root)
+                .output()
+        } else {
+            std::process::Command::new("git")
+                .args(["diff", "HEAD", "--", &file.path])
+                .current_dir(&root)
+                .output()
+        };
+        match output {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                self.diff_text = Some(if text.trim().is_empty() {
+                    "差分はない（内容が HEAD と同じか、バイナリファイル）。".to_string()
+                } else {
+                    text
+                });
+                self.diff_target = Some(file.path.clone());
+                self.editor_open = true;
+            }
+            Err(_) => {
+                self.diff_text = Some("git diff を実行できなかった。".to_string());
+                self.diff_target = Some(file.path.clone());
+                self.editor_open = true;
+            }
+        }
+        cx.notify();
     }
 
     fn on_tree_click(
@@ -302,6 +438,8 @@ impl Workbench {
         self.file_error = None;
         self.status_message = None;
         self.pending_path = None;
+        self.diff_target = None;
+        self.diff_text = None;
         // ファイルを開く操作ではエディタを表示する。
         self.editor_open = true;
         match std::fs::metadata(&path) {
@@ -359,6 +497,7 @@ impl Workbench {
             Ok(()) => {
                 self.dirty = false;
                 self.status_message = Some("保存した".into());
+                self.refresh_changes();
                 cx.notify();
                 true
             }
@@ -602,6 +741,10 @@ impl Workbench {
     }
 
     fn viewer(&self, cx: &Context<Self>) -> Div {
+        // diff 表示が優先（エディタの内容は保持したまま切り替える）。
+        if let (Some(target), Some(text)) = (&self.diff_target, &self.diff_text) {
+            return self.diff_view(target.clone(), text.clone(), cx);
+        }
         let panel = div().v_flex().flex_1().min_w_0().h_full();
 
         if let Some(error) = &self.file_error {
@@ -1033,46 +1176,224 @@ impl Workbench {
             )
     }
 
-    fn changes(&self) -> Div {
+    /// unified diff の表示パネル（エディタ領域に出す）。
+    fn diff_view(&self, target: String, text: String, cx: &Context<Self>) -> Div {
+        let name = target.rsplit('/').next().unwrap_or(&target).to_string();
+        let mut header = panel_header(format!("差分: {name}"), Glyph::GitCompareArrows);
+        header = header.child(div().flex_1()).child(
+            div()
+                .id("close-diff")
+                .cursor_pointer()
+                .px_1()
+                .text_color(rgb(MUTED))
+                .child(icon(Glyph::X))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.diff_target = None;
+                    this.diff_text = None;
+                    cx.notify();
+                })),
+        );
         div()
+            .v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(header)
+            .child(
+                div()
+                    .id("diff-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.diff_scroll)
+                    .child(
+                        div()
+                            .v_flex()
+                            .w_full()
+                            .py_2()
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.))
+                            .children(text.lines().map(|line| {
+                                let (fg, bg) = diff_line_colors(line);
+                                let mut row = div()
+                                    .h_flex()
+                                    .h(px(17.))
+                                    .flex_shrink_0()
+                                    .px_3()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(fg))
+                                    .child(if line.is_empty() {
+                                        " ".to_string()
+                                    } else {
+                                        line.to_string()
+                                    });
+                                if let Some(bg) = bg {
+                                    row = row.bg(rgb(bg));
+                                }
+                                row
+                            })),
+                    ),
+            )
+    }
+
+    fn changes(&self, cx: &Context<Self>) -> Div {
+        let mut header = panel_header("変更", Glyph::GitCompareArrows);
+        if !self.changes.is_empty() {
+            header = header.child(
+                div()
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded_full()
+                    .bg(rgb(SURFACE))
+                    .text_size(px(11.))
+                    .text_color(rgb(TEXT))
+                    .child(self.changes.len().to_string()),
+            );
+        }
+        header = header.child(div().flex_1()).child(
+            div()
+                .id("refresh-changes")
+                .cursor_pointer()
+                .px_1()
+                .text_color(rgb(MUTED))
+                .child(icon(Glyph::RefreshCw))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.refresh_changes();
+                    cx.notify();
+                })),
+        );
+
+        let mut pane = div()
             .v_flex()
             .w(px(252.))
             .flex_shrink_0()
             .h_full()
             .border_l_1()
             .border_color(rgb(LINE))
-            .child(panel_header("変更", Glyph::GitCompareArrows))
-            .child(
+            .child(header);
+
+        if self.project.is_none() {
+            pane = pane.child(
                 div()
                     .px_5()
-                    .pt_8()
-                    .v_flex()
-                    .gap_3()
-                    .child(icon(Glyph::GitBranch).text_color(rgb(MUTED)))
+                    .pt_6()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("プロジェクトを開くと、変更ファイルがここに出る。"),
+            );
+        } else if let Some(error) = &self.changes_error {
+            pane = pane.child(
+                div()
+                    .px_5()
+                    .pt_6()
+                    .text_size(px(12.))
+                    .text_color(rgb(0xe9b4aa))
+                    .child(error.clone()),
+            );
+        } else if self.changes.is_empty() {
+            pane = pane.child(
+                div()
+                    .px_5()
+                    .pt_6()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("変更はない。ワーキングツリーはクリーン。"),
+            );
+        } else {
+            let mut list = div().v_flex().w_full().py_2();
+            for (index, file) in self.changes.iter().enumerate() {
+                let (badge, color) = file.badge();
+                let selected = self.diff_target.as_deref() == Some(file.path.as_str());
+                let path = file.path.clone();
+                let mut row = div()
+                    .id(("change-row", index as u64))
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py(px(5.))
+                    .mx_2()
+                    .rounded(px(6.))
+                    .cursor_pointer()
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("差分の表示を待機中"),
+                            .flex_shrink_0()
+                            .px(px(4.))
+                            .rounded(px(4.))
+                            .bg(rgb(SURFACE))
+                            .font_family(MONO_FONT)
+                            .text_size(px(10.))
+                            .text_color(rgb(color))
+                            .child(badge),
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
                             .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .child("変更ファイルとコードの差分を、ここで確認できるようになる。"),
-                    ),
-            )
-            .child(div().flex_1())
-            .child(
+                            .child(path),
+                    );
+                if selected {
+                    row = row.bg(rgb(SURFACE));
+                }
+                list = list.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(file) = this.changes.get(index) {
+                        let file = ChangedFile {
+                            path: file.path.clone(),
+                            index_status: file.index_status,
+                            worktree_status: file.worktree_status,
+                        };
+                        this.open_diff(&file, cx);
+                    }
+                })));
+            }
+            pane = pane.child(
                 div()
-                    .mx_4()
-                    .mb_5()
-                    .pt_4()
-                    .border_t_1()
-                    .border_color(rgb(LINE))
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child("Git 連携は準備中"),
-            )
+                    .id("changes-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(list),
+            );
+        }
+
+        pane.child(div().flex_1()).child(
+            div()
+                .mx_4()
+                .mb_5()
+                .pt_4()
+                .border_t_1()
+                .border_color(rgb(LINE))
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .child(match (&self.branch, self.changes.len()) {
+                    (Some(branch), 0) => format!("ブランチ: {branch}"),
+                    (Some(branch), n) => format!("ブランチ: {branch} / 変更 {n} 件"),
+                    (None, _) => "Git 連携".to_string(),
+                }),
+        )
+    }
+}
+
+/// diff の行種別ごとの (前景色, 背景色)。
+fn diff_line_colors(line: &str) -> (u32, Option<u32>) {
+    if line.starts_with("diff --git")
+        || line.starts_with("index ")
+        || line.starts_with("---")
+        || line.starts_with("+++")
+    {
+        (MUTED, None)
+    } else if line.starts_with('+') {
+        (0x9ece8a, Some(0x22331d))
+    } else if line.starts_with('-') {
+        (0xe08a7d, Some(0x38231f))
+    } else if line.starts_with("@@") {
+        (ACCENT, None)
+    } else {
+        (0xc6cdd8, None)
     }
 }
 
@@ -1115,7 +1436,7 @@ impl Render for Workbench {
                     .border_color(rgb(LINE))
                     .child(self.sidebar(cx))
                     .child(self.workspace(cx))
-                    .child(self.changes()),
+                    .child(self.changes(cx)),
             )
             .child(
                 div()
