@@ -22,3 +22,5 @@ gpui-kit = { version = "0.9", features = [
 alacritty_terminal = "0.25"
 ignore = "0.4"
 serde_json = "1"
+lsp-types = { version = "0.97", features = ["proposed"] }
+anyhow = "1"

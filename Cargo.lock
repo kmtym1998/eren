@@ -1495,8 +1495,10 @@ name = "eren"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "anyhow",
  "gpui-kit",
  "ignore",
+ "lsp-types",
  "serde_json",
 ]
 

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ pub struct LspClient {
     writer: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<PendingMap>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    diagnostics_version: Arc<AtomicU64>,
     versions: Mutex<HashMap<String, i64>>,
     next_id: AtomicI64,
     /// initialize の応答に含まれるサーバーの capabilities。
@@ -93,11 +94,13 @@ impl LspClient {
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics_version = Arc::new(AtomicU64::new(0));
 
         {
             let writer = Arc::clone(&writer);
             let pending = Arc::clone(&pending);
             let diagnostics = Arc::clone(&diagnostics);
+            let diagnostics_version = Arc::clone(&diagnostics_version);
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 while let Some(message) = read_message(&mut reader) {
@@ -148,6 +151,7 @@ impl LspClient {
                                         .cloned()
                                         .unwrap_or_default();
                                     diagnostics.lock().unwrap().insert(uri.to_string(), list);
+                                    diagnostics_version.fetch_add(1, Ordering::SeqCst);
                                 }
                             }
                         }
@@ -162,6 +166,7 @@ impl LspClient {
             writer,
             pending,
             diagnostics,
+            diagnostics_version,
             versions: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             capabilities: Value::Null,
@@ -324,6 +329,30 @@ impl LspClient {
             return Ok(None);
         };
         Ok(Some(text))
+    }
+
+    /// 参照検索（textDocument/references、宣言も含む）。
+    pub fn references(
+        &self,
+        path: &Path,
+        text: &str,
+        byte_offset: usize,
+    ) -> Result<Vec<LspLocation>, String> {
+        let (line, character) = offset_to_position(text, byte_offset);
+        let result = self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": path_to_uri(path)},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": true}
+            }),
+        )?;
+        Ok(parse_locations(&result))
+    }
+
+    /// 診断が更新されるたびに増えるカウンタ（UI 側のポーリング用）。
+    pub fn diagnostics_version(&self) -> u64 {
+        self.diagnostics_version.load(Ordering::SeqCst)
     }
 
     /// uri に対する最新の診断（publishDiagnostics で届いたもの）。

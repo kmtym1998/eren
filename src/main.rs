@@ -5,7 +5,7 @@ use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::button::*;
 use gpui_kit::component::highlighter::Language;
 use gpui_kit::component::input::{
-    Editor, EditorState, Input, InputEvent, InputState, Position, TabSize,
+    Editor, EditorState, HoverProvider, Input, InputEvent, InputState, Position, Rope, TabSize,
 };
 use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
@@ -22,6 +22,7 @@ actions!(
         ToggleEditor,
         GotoDefinition,
         GotoImplementation,
+        FindReferences,
         NavigateBack,
         NavigateForward
     ]
@@ -217,6 +218,12 @@ pub struct Workbench {
     /// コードジャンプの戻る/進む履歴。
     nav_back: Vec<(PathBuf, Position)>,
     nav_forward: Vec<(PathBuf, Position)>,
+    /// hover プロバイダへ渡す、現在エディタで開いている Rust ファイル。
+    hover_doc: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// 現在のファイルの診断（言語サーバーから届いたもの）。
+    diag_entries: Vec<DiagEntry>,
+    /// 最後に取り込んだ診断カウンタの値。
+    last_diag_version: u64,
 }
 
 /// 定義・実装ジャンプの候補1件。
@@ -224,6 +231,53 @@ pub struct GotoCandidate {
     path: PathBuf,
     position: Position,
     label: String,
+}
+
+/// エディタの hover 表示を言語サーバーへ橋渡しするプロバイダ。
+struct LspHoverProvider {
+    lsp: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<lsp::LspClient>>>>,
+    doc: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+}
+
+impl HoverProvider for LspHoverProvider {
+    fn hover(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Option<lsp_types::Hover>>> {
+        let Some(client) = self.lsp.lock().unwrap().clone() else {
+            return Task::ready(Ok(None));
+        };
+        let Some(path) = self.doc.lock().unwrap().clone() else {
+            return Task::ready(Ok(None));
+        };
+        if !client.supports("hoverProvider") {
+            return Task::ready(Ok(None));
+        }
+        let text = text.to_string();
+        cx.background_spawn(async move {
+            match client.hover(&path, &text, offset) {
+                Ok(Some(value)) => Ok(Some(lsp_types::Hover {
+                    contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+                        kind: lsp_types::MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                })),
+                Ok(None) => Ok(None),
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        })
+    }
+}
+
+/// 診断（エラー・警告）1件。表示とクリックジャンプに使う。
+pub struct DiagEntry {
+    position: Position,
+    severity: u64,
+    message: String,
 }
 
 /// （行, 列）位置 → バイトオフセット。列は文字数（GPUI の Position の流儀）。
@@ -358,6 +412,9 @@ fn panel_header(name: impl Into<SharedString>, glyph: Glyph) -> Div {
 
 impl Workbench {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let lsp_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let lsp_error_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hover_doc_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .line_number(true)
@@ -369,6 +426,15 @@ impl Workbench {
                 .soft_wrap(false)
                 .placeholder("ファイルを選ぶと、ここで編集できる")
         });
+        {
+            let provider = std::rc::Rc::new(LspHoverProvider {
+                lsp: std::sync::Arc::clone(&lsp_slot),
+                doc: std::sync::Arc::clone(&hover_doc_slot),
+            });
+            editor.update(cx, |state, _cx| {
+                state.lsp_mut().hover_provider = Some(provider);
+            });
+        }
         let subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 if !this.dirty {
@@ -394,11 +460,15 @@ impl Workbench {
                 .await;
             let keep = this
                 .update(cx, |this, cx| {
+                    let mut changed = this.refresh_diagnostics(cx);
                     if this.terminal.as_ref().is_some_and(|session| {
                         session
                             .wake
                             .swap(false, std::sync::atomic::Ordering::SeqCst)
                     }) {
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 })
@@ -436,12 +506,15 @@ impl Workbench {
             search_truncated: false,
             _search_subscription: search_subscription,
             pending_position: None,
-            lsp: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            lsp_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            lsp: lsp_slot,
+            lsp_error: lsp_error_slot,
             lsp_open_docs: HashSet::new(),
             goto_candidates: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
+            hover_doc: hover_doc_slot,
+            diag_entries: Vec::new(),
+            last_diag_version: 0,
         }
     }
 
@@ -462,6 +535,9 @@ impl Workbench {
         self.search_truncated = false;
         self.pending_position = None;
         self.lsp_open_docs.clear();
+        *self.hover_doc.lock().unwrap() = None;
+        self.diag_entries = Vec::new();
+        self.last_diag_version = 0;
         self.goto_candidates = None;
         self.nav_back.clear();
         self.nav_forward.clear();
@@ -664,7 +740,12 @@ impl Workbench {
                 client.did_open(&path, "rust", &text);
                 self.lsp_open_docs.insert(path.clone());
             }
+            *self.hover_doc.lock().unwrap() = Some(path.clone());
+        } else {
+            *self.hover_doc.lock().unwrap() = None;
         }
+        // 診断表示は新しいファイル用に取り直す。
+        self.last_diag_version = u64::MAX;
         self.editing_path = Some(path);
         self.dirty = false;
         if let Some(position) = jump {
@@ -807,8 +888,46 @@ impl Workbench {
         }
     }
 
+    /// 言語サーバーから届いた診断を取り込む。変化があれば true。
+    fn refresh_diagnostics(&mut self, cx: &App) -> bool {
+        let client = self.lsp.lock().unwrap().clone();
+        let Some(client) = client else {
+            return false;
+        };
+        let version = client.diagnostics_version();
+        if version == self.last_diag_version {
+            return false;
+        }
+        self.last_diag_version = version;
+        let Some(path) = self.editing_path.clone() else {
+            self.diag_entries = Vec::new();
+            return true;
+        };
+        let text = self.editor.read(cx).text().to_string();
+        self.diag_entries = client
+            .diagnostics_for(&path)
+            .iter()
+            .filter_map(|diag| {
+                let start = diag.pointer("/range/start")?;
+                let line = start.get("line")?.as_u64()? as u32;
+                let character = start.get("character")?.as_u64()? as u32;
+                let offset = lsp::position_to_offset(&text, line, character);
+                Some(DiagEntry {
+                    position: offset_to_char_position(&text, offset),
+                    severity: diag.get("severity").and_then(|s| s.as_u64()).unwrap_or(1),
+                    message: diag.get("message")?.as_str()?.replace('\n', " "),
+                })
+            })
+            .collect();
+        true
+    }
+
     fn goto_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.goto("textDocument/definition", "定義", window, cx);
+    }
+
+    fn find_references(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto("textDocument/references", "参照", window, cx);
     }
 
     fn goto_implementation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -842,8 +961,10 @@ impl Workbench {
         };
         let capability = if method.ends_with("definition") {
             "definitionProvider"
-        } else {
+        } else if method.ends_with("implementation") {
             "implementationProvider"
+        } else {
+            "referencesProvider"
         };
         if !client.supports(capability) {
             self.status_message = Some(format!(
@@ -858,8 +979,13 @@ impl Workbench {
         let origin = (path.clone(), cursor);
         let method_owned = method.to_string();
         let label = kind_label.to_string();
-        let task =
-            cx.background_spawn(async move { client.goto(&method_owned, &path, &text, offset) });
+        let task = cx.background_spawn(async move {
+            if method_owned == "textDocument/references" {
+                client.references(&path, &text, offset)
+            } else {
+                client.goto(&method_owned, &path, &text, offset)
+            }
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1429,6 +1555,13 @@ impl Workbench {
                     ),
             )
             .child(
+                Button::new("find-references")
+                    .ghost()
+                    .small()
+                    .label("参照")
+                    .on_click(cx.listener(|this, _, window, cx| this.find_references(window, cx))),
+            )
+            .child(
                 Button::new("save-file")
                     .ghost()
                     .small()
@@ -1536,6 +1669,62 @@ impl Workbench {
                 );
             }
             panel = panel.child(list);
+        }
+        if !self.diag_entries.is_empty() {
+            let mut bar = div()
+                .id("diag-scroll")
+                .v_flex()
+                .flex_shrink_0()
+                .max_h(px(132.))
+                .overflow_y_scroll()
+                .py_1()
+                .bg(rgb(0x2a2320))
+                .border_b_1()
+                .border_color(rgb(LINE));
+            for (index, entry) in self.diag_entries.iter().enumerate() {
+                let (mark, color) = if entry.severity == 1 {
+                    ("エラー", 0xe06c5a)
+                } else if entry.severity == 2 {
+                    ("警告", 0xe5c07b)
+                } else {
+                    ("情報", MUTED)
+                };
+                let position = entry.position;
+                bar = bar.child(
+                    div()
+                        .id(("diag-row", index as u64))
+                        .h_flex()
+                        .items_baseline()
+                        .gap_2()
+                        .px_4()
+                        .py(px(3.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(SURFACE)))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(color))
+                                .child(mark),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(12.))
+                                .child(format!("{}: {}", position.line + 1, entry.message)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(path) = this.editing_path.clone() {
+                                this.jump_to(path, position, window, cx);
+                            }
+                        })),
+                );
+            }
+            panel = panel.child(bar);
         }
         panel.child(
             div().flex_1().min_h_0().child(
@@ -2089,6 +2278,11 @@ impl Render for Workbench {
                 this.goto_implementation(window, cx)
             }))
             .on_action(
+                cx.listener(|this, _: &FindReferences, window, cx| {
+                    this.find_references(window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &NavigateBack, window, cx| this.navigate_back(window, cx)),
             )
             .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
@@ -2251,6 +2445,7 @@ fn main() {
                 KeyBinding::new("ctrl-e", ToggleEditor, None),
                 KeyBinding::new("f12", GotoDefinition, None),
                 KeyBinding::new("ctrl-f12", GotoImplementation, None),
+                KeyBinding::new("shift-f12", FindReferences, None),
                 KeyBinding::new("alt-left", NavigateBack, None),
                 KeyBinding::new("alt-right", NavigateForward, None),
             ]);
