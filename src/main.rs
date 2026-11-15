@@ -66,6 +66,20 @@ impl Render for Workbench {
 }
 
 fn main() {
+    // CLI flags that must work without a display (Homebrew's formula test,
+    // `eren --version` in scripts, etc.). Anything else launches the GUI.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("eren {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("eren {} — a native workspace for coding agents", env!("CARGO_PKG_VERSION"));
+        println!("Usage: eren [--version|--help]");
+        println!("With no arguments, opens the GUI.");
+        return;
+    }
+
     gpui_kit::application().run(move |cx| {
         // This must be called before using any GPUI Component features.
         gpui_kit::init(cx);

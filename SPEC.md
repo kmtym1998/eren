@@ -49,3 +49,11 @@ cargo run
 ```
 
 要 Rust 安定版ツールチェイン。
+
+## 配布（Homebrew）
+
+- リリースは GitHub Actions（`.github/workflows/release.yml`）で、`v*` タグを push すると macOS arm64 / macOS Intel（cross）/ Linux x86_64 の release バイナリを tar.gz + sha256 にして GitHub Release へ添付する
+- Homebrew は個人 tap `kmtym1998/homebrew-tap` の Formula で配る想定。雛形は `dist/homebrew/eren.rb`（tarball を落として `bin/eren` を入れるだけ、test は `eren --version`）
+- **前提：release の tarball は認証なしで落とせる必要があるので、配布を始める時点で eren repo を public にする**（private のままだと他人の brew が 404 になる）
+- `brew install kmtym1998/tap/eren` で入ってターミナルから `eren` で起動、が v0 の形。.app 化 + Cask 化と公証（notarization）は後続
+- バイナリは `--version` / `--help` を画面なしで処理する（formula の test とスクリプト用）
