@@ -21,10 +21,10 @@ jobs:
       matrix:
         include:
           # Apple Silicon Mac (native build)
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           # Intel Mac (cross-built on the Apple Silicon runner)
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
           # Linux (for Linuxbrew / direct download)
           - os: ubuntu-latest
