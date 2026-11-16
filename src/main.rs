@@ -60,6 +60,15 @@ struct TreeRow {
     expanded: bool,
 }
 
+/// 未対応の文字コードは変換せず拒否し、保存による元バイト列の破損を防ぐ。
+fn decode_editor_text(bytes: Vec<u8>) -> Result<String, &'static str> {
+    if bytes.contains(&0) {
+        return Err("バイナリファイルは開けない。");
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| "UTF-8 以外の文字コードは編集できない。元のファイルは変更していない。")
+}
+
 const MAX_FILE_BYTES: u64 = 2_000_000;
 /// ツリーに出さないフォルダ。
 const SKIPPED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
@@ -462,6 +471,7 @@ impl Workbench {
                 .update(cx, |this, cx| {
                     let mut changed = this.refresh_diagnostics(cx);
                     if this.terminal.as_ref().is_some_and(|session| {
+                        session.process_events();
                         session
                             .wake
                             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -718,12 +728,14 @@ impl Workbench {
                 return;
             }
         };
-        if bytes.iter().take(8192).any(|b| *b == 0) {
-            self.file_error = Some("バイナリファイルは開けない。".into());
-            self.editing_path = None;
-            return;
-        }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = match decode_editor_text(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                self.file_error = Some(error.into());
+                self.editing_path = None;
+                return;
+            }
+        };
         let language = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1166,20 +1178,51 @@ impl Workbench {
         self.open_path_at(path, Some(position), window, cx);
     }
 
-    fn open_project(&mut self, cx: &mut Context<Self>) {
+    /// フォルダ選択後も、未保存の編集を解決するまで現在のプロジェクトを保持する。
+    fn request_project(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dirty {
+            self.load_project(root);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "未保存の変更がある",
+            Some("プロジェクトを切り替える前に、編集中のファイルを保存する？"),
+            &[
+                PromptButton::Ok("保存して開く".into()),
+                PromptButton::Other("破棄して開く".into()),
+                PromptButton::Cancel("キャンセル".into()),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                match answer {
+                    Ok(0) if this.save_current(cx) => this.load_project(root),
+                    Ok(1) => this.load_project(root),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
             prompt: Some("プロジェクトを開く".into()),
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = paths.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(root) = paths.into_iter().next() {
-                            this.load_project(root);
+                            this.request_project(root, window, cx);
                         }
                         this.picker_error = None;
                     }
@@ -1262,7 +1305,9 @@ impl Workbench {
                             .small()
                             .icon(Glyph::FolderOpen)
                             .label("フォルダを開く")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_project(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_project(window, cx)),
+                            ),
                     ),
             )
     }
@@ -1894,6 +1939,7 @@ impl Workbench {
                                 let mut run_div = div()
                                     .flex_shrink_0()
                                     .whitespace_nowrap()
+                                    .w(px(run.columns as f32 * terminal::CELL_W))
                                     .text_color(rgb(run.fg))
                                     .child(run.text.clone());
                                 if run.bg != default_bg {
@@ -2005,7 +2051,7 @@ impl Workbench {
                         .primary()
                         .icon(Glyph::FolderOpen)
                         .label("プロジェクトを開く")
-                        .on_click(cx.listener(|this, _, _, cx| this.open_project(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.open_project(window, cx))),
                 ),
             );
         if let Some(error) = &self.picker_error {
@@ -2476,4 +2522,28 @@ fn main() {
             .expect("ウィンドウを開けなかった");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod editor_safety_tests {
+    use super::decode_editor_text;
+
+    #[test]
+    fn accepts_utf8_without_changing_text() {
+        let text = "日本語と café\r\n";
+        assert_eq!(decode_editor_text(text.as_bytes().to_vec()).unwrap(), text);
+    }
+
+    #[test]
+    fn rejects_non_utf8_instead_of_replacing_bytes() {
+        assert!(decode_editor_text(b"caf\xe9\n".to_vec()).is_err());
+        assert!(decode_editor_text(vec![0x93, 0xfa, 0x96, 0x7b]).is_err());
+    }
+
+    #[test]
+    fn rejects_nul_even_after_the_old_probe_limit() {
+        let mut bytes = vec![b'a'; 9000];
+        bytes.push(0);
+        assert!(decode_editor_text(bytes).is_err());
+    }
 }
