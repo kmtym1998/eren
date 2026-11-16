@@ -219,6 +219,8 @@ pub struct Workbench {
     lsp: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<lsp::LspClient>>>>,
     /// 言語サーバーの起動に失敗した場合の理由。
     lsp_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// 起動中（または起動を試みた）言語サーバーの名前。
+    lsp_server: Option<&'static str>,
     /// LSP に didOpen 済みのファイル。
     lsp_open_docs: HashSet<PathBuf>,
     /// ジャンプ候補（複数ヒット時）とジャンプ元の位置。
@@ -360,6 +362,39 @@ fn rust_analyzer_program() -> String {
         }
     }
     "rust-analyzer".to_string()
+}
+
+/// 拡張子から LSP の言語 ID を返す。対応外は None。
+fn lsp_language_id(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => Some("rust"),
+        Some("ts") => Some("typescript"),
+        Some("tsx") => Some("typescriptreact"),
+        Some("js") => Some("javascript"),
+        Some("jsx") => Some("javascriptreact"),
+        _ => None,
+    }
+}
+
+/// 起動中の言語サーバーがその言語を扱えるか。
+fn lsp_server_supports(server: Option<&str>, language: &str) -> bool {
+    match server {
+        Some("rust-analyzer") => language == "rust",
+        Some("typescript-language-server") => matches!(
+            language,
+            "typescript" | "typescriptreact" | "javascript" | "javascriptreact"
+        ),
+        _ => false,
+    }
+}
+
+/// PATH から実行ファイルを探す。
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var).find_map(|dir| {
+        let candidate = dir.join(name);
+        candidate.exists().then_some(candidate)
+    })
 }
 
 /// 横断検索のヒット1件。
@@ -530,6 +565,7 @@ impl Workbench {
             pending_position: None,
             lsp: lsp_slot,
             lsp_error: lsp_error_slot,
+            lsp_server: None,
             lsp_open_docs: HashSet::new(),
             goto_candidates: None,
             nav_back: Vec::new(),
@@ -565,13 +601,35 @@ impl Workbench {
         self.nav_forward.clear();
         *self.lsp.lock().unwrap() = None;
         *self.lsp_error.lock().unwrap() = None;
-        // Rust プロジェクトなら言語サーバーをバックグラウンドで起動する。
-        if root.join("Cargo.toml").exists() {
+        self.lsp_server = None;
+        // プロジェクトの種類に応じて言語サーバーをバックグラウンドで起動する。
+        let server: Option<(&'static str, String, Vec<String>)> =
+            if root.join("Cargo.toml").exists() {
+                Some(("rust-analyzer", rust_analyzer_program(), Vec::new()))
+            } else if root.join("package.json").exists() {
+                match find_on_path("typescript-language-server") {
+                    Some(program) => Some((
+                        "typescript-language-server",
+                        program.to_string_lossy().into_owned(),
+                        vec!["--stdio".to_string()],
+                    )),
+                    None => {
+                        *self.lsp_error.lock().unwrap() =
+                            Some("typescript-language-server が PATH に見つからない".to_string());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        if let Some((name, program, args)) = server {
+            self.lsp_server = Some(name);
             let slot = std::sync::Arc::clone(&self.lsp);
             let error_slot = std::sync::Arc::clone(&self.lsp_error);
             let root_for_thread = root.clone();
             std::thread::spawn(move || {
-                match lsp::LspClient::spawn(&rust_analyzer_program(), &[], &root_for_thread) {
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                match lsp::LspClient::spawn(&program, &arg_refs, &root_for_thread) {
                     Ok(client) => {
                         *slot.lock().unwrap() = Some(std::sync::Arc::new(client));
                     }
@@ -761,10 +819,12 @@ impl Workbench {
             state.set_value(text.clone(), window, cx);
         });
         // 言語サーバーが起動していれば、このファイルを開いたことを伝える。
-        if path.extension().is_some_and(|ext| ext == "rs") {
+        let lsp_language = lsp_language_id(&path)
+            .filter(|language| lsp_server_supports(self.lsp_server, language));
+        if let Some(language) = lsp_language {
             let client = self.lsp.lock().unwrap().clone();
             if let Some(client) = client {
-                client.did_open(&path, "rust", &text);
+                client.did_open(&path, language, &text);
                 self.lsp_open_docs.insert(path.clone());
             }
             *self.hover_doc.lock().unwrap() = Some(path.clone());

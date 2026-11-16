@@ -35,7 +35,8 @@ Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15
 - [x] LSP クライアント基盤（2026-11-15 実装）：`src/lsp.rs` に自前の最小 JSON-RPC クライアント（stdio、読み取り専用スレッド＋同期リクエスト、全文同期）。当初案の async-lsp は使わず同期スレッド方式にした（GPUI のバックグラウンドタスクから呼ぶ）。initialize で capabilities を保持し、対応可否でジャンプを出し分ける
 - [x] rust-analyzer で definition / implementation ジャンプ（2026-11-15 実装）：プロジェクト（Cargo.toml あり）を開くとバックグラウンドで自動起動。F12=定義、Ctrl+F12=実装、エディタヘッダーにもボタン。複数ヒットは候補リスト、戻る/進む履歴（Alt+←/→）付き。UTF-16 位置変換あり（単体テスト＋実サーバー結合テスト＋GUI 確認済み）。rust-analyzer は rustup の shim ではなく toolchain 実体を優先して解決する
 - [x] references / hover / 診断表示（2026-11-15 実装）：Shift+F12・ヘッダー「参照」で参照検索（候補リスト表示）。hover はエディタ組み込みの HoverProvider に自前クライアントを接続し、実サーバーの内容を表示。診断は publishDiagnostics を取り込み、エディタ上部に重大度つきのバーを表示（クリックで該当行へジャンプ、40ms ポーリングで更新）
-- [ ] TypeScript サーバー対応、外部変更の再同期（watcher）、index 完了待ちの表示
+- [x] TypeScript サーバー対応（2026-11-16）：package.json のあるプロジェクトでは PATH 上の typescript-language-server を `--stdio` で起動（Cargo.toml があれば rust-analyzer を優先）。言語 ID は拡張子から判定（rs / ts / tsx / js / jsx）し、サーバーが扱える言語だけ didOpen する。GUI で定義ジャンプと hover を確認済み。前提：プロジェクト側に typescript が入っていること（サーバーが workspace 内を探す）。見つからない場合はステータスに理由を表示
+- [ ] 外部変更の再同期（watcher）、index 完了待ちの表示
 
 ### Phase 3（ターミナル + agent 管理）
 - [x] ターミナル pane の土台（前倒しで実施、2026-11-15 ローカル実装）：alacritty_terminal 0.25 + PTY でログインシェルをプロジェクトフォルダで起動。グリッド描画（色・太字・反転・ブロックカーソル）、キー入力（Ctrl 組み合わせ・矢印・Alt プレフィックス）、ペインサイズへの追従（canvas 実測で cols/rows を再計算）。中央ペインの主役として常時表示され、エディタはトグル表示。残り：マウス選択・コピー、日本語 IME 入力、複数ターミナル
