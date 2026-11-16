@@ -426,6 +426,17 @@ impl LspClient {
         Ok(parse_locations(&result))
     }
 
+    /// textDocument/documentSymbol の result（JSON）をそのまま返す。
+    /// 構造の解釈は symbols モジュール側で行う。
+    pub fn document_symbols(&self, path: &Path) -> Result<Value, String> {
+        self.request(
+            "textDocument/documentSymbol",
+            json!({
+                "textDocument": {"uri": path_to_uri(path)}
+            }),
+        )
+    }
+
     /// 診断が更新されるたびに増えるカウンタ（UI 側のポーリング用）。
     pub fn diagnostics_version(&self) -> u64 {
         self.diagnostics_version.load(Ordering::SeqCst)

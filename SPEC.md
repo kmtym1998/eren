@@ -39,6 +39,7 @@ Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15
 - [x] TypeScript サーバー対応（2026-11-16）：package.json のあるプロジェクトでは PATH 上の typescript-language-server を `--stdio` で起動（Cargo.toml があれば rust-analyzer を優先）。言語 ID は拡張子から判定（rs / ts / tsx / js / jsx）し、サーバーが扱える言語だけ didOpen する。GUI で定義ジャンプと hover を確認済み。前提：プロジェクト側に typescript が入っていること（サーバーが workspace 内を探す）。見つからない場合はステータスに理由を表示
 - [x] 外部変更の再同期（2026-11-16）：開いているファイルの更新時刻＋内容ハッシュを約1秒ごとにポーリング。未保存の変更がなければ自動で読み直し（カーソル位置を保持、LSP へも再同期）、あれば上書きせずステータスに警告。削除も一度だけ通知する。notify クレートは使わずポーリングで実装
 - [x] index 進捗表示（2026-11-16）：`$/progress`（workDoneProgress）をクライアントで保持し、ステータスバーに「LSP: タイトル 進捗%: メッセージ」形式で表示。rust-analyzer の Fetching / Roots Scanned が実際に出ることを GUI で確認済み。これで Phase 2 は完了
+- [x] documentSymbol のシンボル一覧（2026-11-16、Codex が `src/symbols.rs` を実装・助手が統合）：エディタヘッダーの「シンボル」ボタン / Cmd+Shift+O・Ctrl+Shift+O で現在のファイルのシンボル一覧パネルを出し、クリックでその位置へジャンプ（履歴にも積む）。rust-analyzer の実応答で表示とジャンプを GUI 確認済み。ついでにエディタヘッダーのボタンを xsmall 化し、タイトル省略と overflow_hidden で狭い幅でも Changes 側へはみ出さないようにした
 
 ### Phase 3（ターミナル + agent 管理）
 - [x] ターミナル pane の土台（前倒しで実施、2026-11-15 ローカル実装）：alacritty_terminal 0.25 + PTY でログインシェルをプロジェクトフォルダで起動。グリッド描画（色・太字・反転・ブロックカーソル）、キー入力（Ctrl 組み合わせ・矢印・Alt プレフィックス）、ペインサイズへの追従（canvas 実測で cols/rows を再計算）。中央ペインの主役として常時表示され、エディタはトグル表示。残り：マウス選択・コピー、日本語 IME 入力、複数ターミナル

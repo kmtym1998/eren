@@ -12,6 +12,7 @@ use gpui_kit::*;
 
 mod agents;
 mod lsp;
+mod symbols;
 mod terminal;
 mod worktrees;
 
@@ -25,6 +26,7 @@ actions!(
         GotoDefinition,
         GotoImplementation,
         FindReferences,
+        ShowSymbols,
         NavigateBack,
         NavigateForward
     ]
@@ -231,6 +233,8 @@ pub struct Workbench {
     lsp_open_docs: HashSet<PathBuf>,
     /// ジャンプ候補（複数ヒット時）とジャンプ元の位置。
     goto_candidates: Option<(Vec<GotoCandidate>, (PathBuf, Position))>,
+    /// シンボル一覧パネル（documentSymbol の結果）。
+    symbol_entries: Option<Vec<symbols::SymbolEntry>>,
     /// コードジャンプの戻る/進む履歴。
     nav_back: Vec<(PathBuf, Position)>,
     nav_forward: Vec<(PathBuf, Position)>,
@@ -501,6 +505,7 @@ fn panel_header(name: impl Into<SharedString>, glyph: Glyph) -> Div {
         .h_flex()
         .h(px(46.))
         .flex_shrink_0()
+        .overflow_hidden()
         .items_center()
         .gap_2()
         .px_4()
@@ -508,7 +513,15 @@ fn panel_header(name: impl Into<SharedString>, glyph: Glyph) -> Div {
         .border_color(rgb(LINE))
         .text_color(rgb(MUTED))
         .child(icon(glyph))
-        .child(div().text_color(rgb(TEXT)).child(name.into()))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_color(rgb(TEXT))
+                .child(name.into()),
+        )
 }
 
 impl Workbench {
@@ -633,6 +646,7 @@ impl Workbench {
             disk_state: None,
             lsp_open_docs: HashSet::new(),
             goto_candidates: None,
+            symbol_entries: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             hover_doc: hover_doc_slot,
@@ -667,6 +681,7 @@ impl Workbench {
         self.lsp_progress = Vec::new();
         self.last_progress_version = 0;
         self.goto_candidates = None;
+        self.symbol_entries = None;
         self.nav_back.clear();
         self.nav_forward.clear();
         *self.lsp.lock().unwrap() = None;
@@ -1276,6 +1291,53 @@ impl Workbench {
 
     fn find_references(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.goto("textDocument/references", "参照", window, cx);
+    }
+
+    /// 現在のファイルのシンボル一覧を取得してパネルに出す。
+    fn show_symbols(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.editing_path.clone() else {
+            return;
+        };
+        if self.diff_target.is_some() {
+            return;
+        }
+        let client = self.lsp.lock().unwrap().clone();
+        let Some(client) = client else {
+            if let Some(error) = self.lsp_error.lock().unwrap().clone() {
+                self.status_message = Some(format!("言語サーバーを起動できなかった: {error}"));
+            } else {
+                self.status_message =
+                    Some("言語サーバーは起動中。少し待ってからもう一度試して".into());
+            }
+            cx.notify();
+            return;
+        };
+        if !client.supports("documentSymbolProvider") {
+            self.status_message = Some("この言語サーバーはシンボル表示に対応していない".into());
+            cx.notify();
+            return;
+        }
+        let task = cx.background_spawn(async move { client.document_symbols(&path) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                match result {
+                    Ok(value) => {
+                        let entries = symbols::parse_document_symbols(&value);
+                        if entries.is_empty() {
+                            this.status_message = Some("シンボルが見つからなかった".into());
+                        } else {
+                            this.symbol_entries = Some(entries);
+                        }
+                    }
+                    Err(error) => {
+                        this.status_message = Some(format!("シンボルを取得できなかった: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn goto_implementation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2030,14 +2092,14 @@ impl Workbench {
             .child(
                 Button::new("goto-definition")
                     .ghost()
-                    .small()
+                    .xsmall()
                     .label("定義")
                     .on_click(cx.listener(|this, _, window, cx| this.goto_definition(window, cx))),
             )
             .child(
                 Button::new("goto-implementation")
                     .ghost()
-                    .small()
+                    .xsmall()
                     .label("実装")
                     .on_click(
                         cx.listener(|this, _, window, cx| this.goto_implementation(window, cx)),
@@ -2046,14 +2108,21 @@ impl Workbench {
             .child(
                 Button::new("find-references")
                     .ghost()
-                    .small()
+                    .xsmall()
                     .label("参照")
                     .on_click(cx.listener(|this, _, window, cx| this.find_references(window, cx))),
             )
             .child(
+                Button::new("show-symbols")
+                    .ghost()
+                    .xsmall()
+                    .label("シンボル")
+                    .on_click(cx.listener(|this, _, window, cx| this.show_symbols(window, cx))),
+            )
+            .child(
                 Button::new("save-file")
                     .ghost()
-                    .small()
+                    .xsmall()
                     .label("保存")
                     .disabled(!self.dirty)
                     .on_click(cx.listener(|this, _, _, cx| this.save_file(cx))),
@@ -2152,6 +2221,96 @@ impl Workbench {
                                     this.nav_back.push(origin);
                                     this.nav_forward.clear();
                                     this.jump_to(candidate.path, candidate.position, window, cx);
+                                }
+                            }
+                        })),
+                );
+            }
+            panel = panel.child(list);
+        }
+        if let Some(entries) = &self.symbol_entries {
+            let mut list = div()
+                .id("symbols-scroll")
+                .v_flex()
+                .flex_shrink_0()
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .py_1()
+                .bg(rgb(SURFACE))
+                .border_b_1()
+                .border_color(rgb(LINE));
+            list = list.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .px_4()
+                    .py(px(3.))
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("シンボル {} 件", entries.len()))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("symbols-close")
+                            .cursor_pointer()
+                            .child(icon(Glyph::X))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.symbol_entries = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+            for (index, entry) in entries.iter().enumerate() {
+                list = list.child(
+                    div()
+                        .id(("symbol-row", index as u64))
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(16. + entry.depth as f32 * 14.))
+                        .pr_4()
+                        .py(px(4.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(SIDEBAR)))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(ACCENT))
+                                .child(entry.kind.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(12.))
+                                .child(entry.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .child(format!(":{}", entry.line + 1)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(entries) = this.symbol_entries.take() {
+                                if let Some(entry) = entries.into_iter().nth(index) {
+                                    if let Some(current) = this.editing_path.clone() {
+                                        let cursor = this.editor.read(cx).cursor_position();
+                                        let location = lsp::LspLocation {
+                                            path: current.clone(),
+                                            line: entry.line as u32,
+                                            character: entry.character as u32,
+                                        };
+                                        this.jump_to_location(
+                                            &location,
+                                            (current, cursor),
+                                            window,
+                                            cx,
+                                        );
+                                    }
                                 }
                             }
                         })),
@@ -3002,6 +3161,9 @@ impl Render for Workbench {
                 }),
             )
             .on_action(
+                cx.listener(|this, _: &ShowSymbols, window, cx| this.show_symbols(window, cx)),
+            )
+            .on_action(
                 cx.listener(|this, _: &NavigateBack, window, cx| this.navigate_back(window, cx)),
             )
             .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
@@ -3174,6 +3336,8 @@ fn main() {
                 KeyBinding::new("f12", GotoDefinition, None),
                 KeyBinding::new("ctrl-f12", GotoImplementation, None),
                 KeyBinding::new("shift-f12", FindReferences, None),
+                KeyBinding::new("cmd-shift-o", ShowSymbols, None),
+                KeyBinding::new("ctrl-shift-o", ShowSymbols, None),
                 KeyBinding::new("alt-left", NavigateBack, None),
                 KeyBinding::new("alt-right", NavigateForward, None),
             ]);
