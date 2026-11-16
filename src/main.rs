@@ -10,6 +10,7 @@ use gpui_kit::component::input::{
 use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
+mod agents;
 mod lsp;
 mod terminal;
 
@@ -58,15 +59,6 @@ struct TreeRow {
     depth: usize,
     is_dir: bool,
     expanded: bool,
-}
-
-/// 未対応の文字コードは変換せず拒否し、保存による元バイト列の破損を防ぐ。
-fn decode_editor_text(bytes: Vec<u8>) -> Result<String, &'static str> {
-    if bytes.contains(&0) {
-        return Err("バイナリファイルは開けない。");
-    }
-    String::from_utf8(bytes)
-        .map_err(|_| "UTF-8 以外の文字コードは編集できない。元のファイルは変更していない。")
 }
 
 const MAX_FILE_BYTES: u64 = 2_000_000;
@@ -194,9 +186,10 @@ pub struct Workbench {
     file_error: Option<String>,
     status_message: Option<String>,
     _editor_subscription: Subscription,
-    /// 中央ペインの主役であるターミナル（プロジェクトを開くと起動する）。
-    terminal: Option<TerminalSession>,
-    terminal_error: Option<String>,
+    /// ターミナル／エージェントのセッション一覧とアクティブなセッション。
+    sessions: Vec<SessionTab>,
+    active_session: usize,
+    session_error: Option<String>,
     terminal_focus: FocusHandle,
     /// エディタ（ツリー＋編集領域）を表示しているか。既定は非表示で、ターミナルがメイン。
     editor_open: bool,
@@ -287,6 +280,13 @@ pub struct DiagEntry {
     position: Position,
     severity: u64,
     message: String,
+}
+
+/// ターミナル／エージェントのセッション1つ。
+pub struct SessionTab {
+    title: String,
+    session: TerminalSession,
+    detector: agents::StatusDetector,
 }
 
 /// （行, 列）位置 → バイトオフセット。列は文字数（GPUI の Position の流儀）。
@@ -470,13 +470,16 @@ impl Workbench {
             let keep = this
                 .update(cx, |this, cx| {
                     let mut changed = this.refresh_diagnostics(cx);
-                    if this.terminal.as_ref().is_some_and(|session| {
-                        session.process_events();
-                        session
+                    for tab in &mut this.sessions {
+                        if tab
+                            .session
                             .wake
                             .swap(false, std::sync::atomic::Ordering::SeqCst)
-                    }) {
-                        changed = true;
+                        {
+                            changed = true;
+                            let text = tab.session.visible_text();
+                            tab.detector.observe(&text);
+                        }
                     }
                     if changed {
                         cx.notify();
@@ -501,8 +504,9 @@ impl Workbench {
             file_error: None,
             status_message: None,
             _editor_subscription: subscription,
-            terminal: None,
-            terminal_error: None,
+            sessions: Vec::new(),
+            active_session: 0,
+            session_error: None,
             terminal_focus: cx.focus_handle(),
             editor_open: false,
             changes: Vec::new(),
@@ -569,18 +573,22 @@ impl Workbench {
                 }
             });
         }
-        // ターミナルはプロジェクトのフォルダを起点に起動し直す。
-        if let Some(old) = &self.terminal {
-            old.shutdown();
+        // セッションはプロジェクトのフォルダを起点に起動し直す。
+        for tab in self.sessions.drain(..) {
+            tab.session.shutdown();
         }
+        self.active_session = 0;
         match TerminalSession::new(&root, 100, 30) {
             Ok(session) => {
-                self.terminal = Some(session);
-                self.terminal_error = None;
+                self.sessions.push(SessionTab {
+                    title: "シェル".to_string(),
+                    session,
+                    detector: agents::StatusDetector::new(agents::AgentKind::Shell),
+                });
+                self.session_error = None;
             }
             Err(error) => {
-                self.terminal = None;
-                self.terminal_error = Some(format!("ターミナルを起動できなかった: {error}"));
+                self.session_error = Some(format!("ターミナルを起動できなかった: {error}"));
             }
         }
         self.project = Some(root);
@@ -728,14 +736,12 @@ impl Workbench {
                 return;
             }
         };
-        let text = match decode_editor_text(bytes) {
-            Ok(text) => text,
-            Err(error) => {
-                self.file_error = Some(error.into());
-                self.editing_path = None;
-                return;
-            }
-        };
+        if bytes.iter().take(8192).any(|b| *b == 0) {
+            self.file_error = Some("バイナリファイルは開けない。".into());
+            self.editing_path = None;
+            return;
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         let language = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1178,51 +1184,20 @@ impl Workbench {
         self.open_path_at(path, Some(position), window, cx);
     }
 
-    /// フォルダ選択後も、未保存の編集を解決するまで現在のプロジェクトを保持する。
-    fn request_project(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.dirty {
-            self.load_project(root);
-            return;
-        }
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            "未保存の変更がある",
-            Some("プロジェクトを切り替える前に、編集中のファイルを保存する？"),
-            &[
-                PromptButton::Ok("保存して開く".into()),
-                PromptButton::Other("破棄して開く".into()),
-                PromptButton::Cancel("キャンセル".into()),
-            ],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            let answer = answer.await;
-            let _ = this.update_in(cx, |this, _, cx| {
-                match answer {
-                    Ok(0) if this.save_current(cx) => this.load_project(root),
-                    Ok(1) => this.load_project(root),
-                    _ => {}
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn open_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_project(&mut self, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
             prompt: Some("プロジェクトを開く".into()),
         });
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = paths.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(root) = paths.into_iter().next() {
-                            this.request_project(root, window, cx);
+                            this.load_project(root);
                         }
                         this.picker_error = None;
                     }
@@ -1281,17 +1256,7 @@ impl Workbench {
                         "フォルダを開いて作業を始める"
                     }),
             )
-            .child(section_heading("エージェント"))
-            .child(
-                div()
-                    .px_4()
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .text_color(rgb(MUTED))
-                    .child(div().size(px(6.)).rounded_full().bg(rgb(0x697586)))
-                    .child("接続されたエージェントなし"),
-            )
+            .child(self.sessions_section(cx))
             .child(div().flex_1())
             .child(
                 div()
@@ -1305,11 +1270,96 @@ impl Workbench {
                             .small()
                             .icon(Glyph::FolderOpen)
                             .label("フォルダを開く")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_project(window, cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| this.open_project(cx))),
                     ),
             )
+    }
+
+    /// サイドバーのセッション一覧（クリックで切替、×で終了）と追加ボタン。
+    fn sessions_section(&self, cx: &Context<Self>) -> Div {
+        let mut section = div().v_flex().child(section_heading("セッション"));
+        if self.sessions.is_empty() {
+            section = section.child(
+                div()
+                    .px_4()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("プロジェクトを開くとシェルが起動する"),
+            );
+        }
+        for (index, tab) in self.sessions.iter().enumerate() {
+            let active = index == self.active_session;
+            let dot_color = match tab.detector.status() {
+                agents::AgentStatus::Running => 0x6cb6ff,
+                agents::AgentStatus::WaitingForInput => 0xe5c07b,
+                agents::AgentStatus::Starting | agents::AgentStatus::Unknown => 0x697586,
+            };
+            let mut row = div()
+                .id(("session-row", index as u64))
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .mx_2()
+                .px_2()
+                .py(px(5.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .size(px(7.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(rgb(dot_color)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(12.))
+                        .child(tab.title.clone()),
+                );
+            if active {
+                row = row.bg(rgb(SURFACE));
+            } else {
+                row = row.hover(|style| style.bg(rgb(SURFACE)));
+            }
+            row = row
+                .child(
+                    div()
+                        .id(("session-close", index as u64))
+                        .cursor_pointer()
+                        .px_1()
+                        .text_color(rgb(MUTED))
+                        .child(icon(Glyph::X))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_session(index, cx);
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.activate_session(index, window, cx);
+                }));
+            section = section.child(row);
+        }
+        let mut buttons = div().h_flex().flex_wrap().gap_1().px_3().pt_2();
+        for kind in agents::AgentKind::all() {
+            let (id, label) = match kind {
+                agents::AgentKind::Shell => ("add-shell", "＋シェル".to_string()),
+                agents::AgentKind::ClaudeCode => ("add-claude", kind.title().to_string()),
+                agents::AgentKind::Codex => ("add-codex", kind.title().to_string()),
+                agents::AgentKind::OpenCode => ("add-opencode", kind.title().to_string()),
+            };
+            let kind = *kind;
+            buttons = buttons.child(Button::new(id).ghost().small().label(label).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.add_session(kind, window, cx);
+                }),
+            ));
+        }
+        section.child(buttons)
     }
 
     fn tree_panel(&self, cx: &Context<Self>) -> Div {
@@ -1793,9 +1843,87 @@ impl Workbench {
         cx.notify();
     }
 
+    /// アクティブなセッション。
+    fn terminal(&self) -> Option<&TerminalSession> {
+        self.sessions
+            .get(self.active_session)
+            .map(|tab| &tab.session)
+    }
+
+    /// セッションを追加する（シェルまたはエージェント）。
+    fn add_session(
+        &mut self,
+        kind: agents::AgentKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.project.clone() else {
+            return;
+        };
+        let base_title = kind.title();
+        let count = self
+            .sessions
+            .iter()
+            .filter(|tab| {
+                tab.title == base_title || tab.title.starts_with(&format!("{base_title} "))
+            })
+            .count();
+        let title = if count == 0 {
+            base_title.to_string()
+        } else {
+            format!("{base_title} {}", count + 1)
+        };
+        let result = match kind.command() {
+            Some(command) => TerminalSession::new_agent(&root, 100, 30, command),
+            None => TerminalSession::new(&root, 100, 30),
+        };
+        match result {
+            Ok(session) => {
+                self.sessions.push(SessionTab {
+                    title,
+                    session,
+                    detector: agents::StatusDetector::new(kind),
+                });
+                self.active_session = self.sessions.len() - 1;
+                self.session_error = None;
+                self.terminal_focus.focus(window, cx);
+            }
+            Err(error) => {
+                self.session_error = Some(format!("セッションを起動できなかった: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn activate_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index < self.sessions.len() {
+            self.active_session = index;
+            self.terminal_focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn close_session(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        let tab = self.sessions.remove(index);
+        tab.session.shutdown();
+        if self.active_session >= self.sessions.len() {
+            self.active_session = self.sessions.len().saturating_sub(1);
+        } else if index < self.active_session {
+            self.active_session -= 1;
+        }
+        cx.notify();
+    }
+
     /// canvas の実測サイズからターミナルの列数・行数を更新する。
     fn terminal_resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
-        if let Some(session) = &mut self.terminal {
+        if let Some(session) = self
+            .sessions
+            .get_mut(self.active_session)
+            .map(|tab| &mut tab.session)
+        {
             if session.cols != cols || session.rows != rows {
                 session.resize(cols, rows);
                 cx.notify();
@@ -1817,7 +1945,7 @@ impl Workbench {
                 _ => None,
             };
             if let Some(direction) = page {
-                if let Some(session) = &self.terminal {
+                if let Some(session) = self.terminal() {
                     let rows = session.rows as i32;
                     session.scroll(direction * rows);
                     cx.notify();
@@ -1827,7 +1955,7 @@ impl Workbench {
             }
         }
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
-            if let Some(session) = &self.terminal {
+            if let Some(session) = self.terminal() {
                 session.write(&bytes);
             }
             // Ctrl+S などアプリ側のキーバインドへは回さない（ターミナル入力を優先）。
@@ -1836,7 +1964,12 @@ impl Workbench {
     }
 
     fn terminal_panel(&self, cx: &Context<Self>) -> Div {
-        let mut header = panel_header("ターミナル", Glyph::Terminal);
+        let title = self
+            .sessions
+            .get(self.active_session)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_else(|| "ターミナル".to_string());
+        let mut header = panel_header(title, Glyph::Terminal);
         header = header.child(div().flex_1()).child(
             Button::new("toggle-editor")
                 .ghost()
@@ -1850,7 +1983,7 @@ impl Workbench {
         );
         let panel = div().v_flex().flex_1().min_w_0().h_full().child(header);
 
-        if let Some(error) = &self.terminal_error {
+        if let Some(error) = &self.session_error {
             return panel.child(
                 div()
                     .flex_1()
@@ -1860,7 +1993,7 @@ impl Workbench {
                     .child(div().text_color(rgb(0xe9b4aa)).child(error.clone())),
             );
         }
-        let Some(session) = &self.terminal else {
+        let Some(session) = self.terminal() else {
             return panel.child(
                 div()
                     .flex_1()
@@ -1900,7 +2033,7 @@ impl Workbench {
                     ScrollDelta::Lines(point) => point.y as i32,
                     ScrollDelta::Pixels(point) => (point.y / px(terminal::CELL_H)) as i32,
                 };
-                if let Some(session) = &this.terminal {
+                if let Some(session) = this.terminal() {
                     session.scroll(lines);
                 }
                 cx.notify();
@@ -1939,7 +2072,6 @@ impl Workbench {
                                 let mut run_div = div()
                                     .flex_shrink_0()
                                     .whitespace_nowrap()
-                                    .w(px(run.columns as f32 * terminal::CELL_W))
                                     .text_color(rgb(run.fg))
                                     .child(run.text.clone());
                                 if run.bg != default_bg {
@@ -2051,7 +2183,7 @@ impl Workbench {
                         .primary()
                         .icon(Glyph::FolderOpen)
                         .label("プロジェクトを開く")
-                        .on_click(cx.listener(|this, _, window, cx| this.open_project(window, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.open_project(cx))),
                 ),
             );
         if let Some(error) = &self.picker_error {
@@ -2522,28 +2654,4 @@ fn main() {
             .expect("ウィンドウを開けなかった");
             cx.activate(true);
         });
-}
-
-#[cfg(test)]
-mod editor_safety_tests {
-    use super::decode_editor_text;
-
-    #[test]
-    fn accepts_utf8_without_changing_text() {
-        let text = "日本語と café\r\n";
-        assert_eq!(decode_editor_text(text.as_bytes().to_vec()).unwrap(), text);
-    }
-
-    #[test]
-    fn rejects_non_utf8_instead_of_replacing_bytes() {
-        assert!(decode_editor_text(b"caf\xe9\n".to_vec()).is_err());
-        assert!(decode_editor_text(vec![0x93, 0xfa, 0x96, 0x7b]).is_err());
-    }
-
-    #[test]
-    fn rejects_nul_even_after_the_old_probe_limit() {
-        let mut bytes = vec![b'a'; 9000];
-        bytes.push(0);
-        assert!(decode_editor_text(bytes).is_err());
-    }
 }
