@@ -11,6 +11,7 @@ use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMod
 use gpui_kit::*;
 
 mod agents;
+mod diff;
 mod lsp;
 mod symbols;
 mod terminal;
@@ -210,6 +211,8 @@ pub struct Workbench {
     /// diff 表示中のファイル（相対パス）とその unified diff。
     diff_target: Option<String>,
     diff_text: Option<String>,
+    /// 差分を左右分割で表示するか（false = unified）。
+    diff_split: bool,
     diff_scroll: ScrollHandle,
     /// プロジェクト横断検索の入力欄と結果。
     search_input: Entity<InputState>,
@@ -633,6 +636,7 @@ impl Workbench {
             changes_error: None,
             diff_target: None,
             diff_text: None,
+            diff_split: false,
             diff_scroll: ScrollHandle::new(),
             search_input,
             search_query: String::new(),
@@ -669,6 +673,7 @@ impl Workbench {
         self.editor_open = false;
         self.diff_target = None;
         self.diff_text = None;
+        self.diff_split = false;
         self.search_query = String::new();
         self.search_results = Vec::new();
         self.search_truncated = false;
@@ -2921,19 +2926,104 @@ impl Workbench {
     fn diff_view(&self, target: String, text: String, cx: &Context<Self>) -> Div {
         let name = target.rsplit('/').next().unwrap_or(&target).to_string();
         let mut header = panel_header(format!("差分: {name}"), Glyph::GitCompareArrows);
-        header = header.child(div().flex_1()).child(
+        header = header
+            .child(div().flex_1())
+            .child(
+                Button::new("diff-mode-toggle")
+                    .ghost()
+                    .xsmall()
+                    .label(if self.diff_split { "統合" } else { "分割" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.diff_split = !this.diff_split;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("close-diff")
+                    .cursor_pointer()
+                    .px_1()
+                    .text_color(rgb(MUTED))
+                    .child(icon(Glyph::X))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.diff_target = None;
+                        this.diff_text = None;
+                        cx.notify();
+                    })),
+            );
+        let body = if self.diff_split {
+            let parsed = diff::parse_unified_diff(&text);
+            let rows = diff::to_split_rows(&parsed);
             div()
-                .id("close-diff")
-                .cursor_pointer()
-                .px_1()
-                .text_color(rgb(MUTED))
-                .child(icon(Glyph::X))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.diff_target = None;
-                    this.diff_text = None;
-                    cx.notify();
-                })),
-        );
+                .v_flex()
+                .w_full()
+                .py_2()
+                .font_family(MONO_FONT)
+                .text_size(px(12.))
+                .children(rows.into_iter().map(|row| {
+                    match row {
+                        diff::SplitRow::Full(line) => {
+                            let (fg, bg) = diff_kind_colors(line.kind);
+                            let mut row_div = div()
+                                .h_flex()
+                                .h(px(17.))
+                                .flex_shrink_0()
+                                .px_3()
+                                .whitespace_nowrap()
+                                .text_color(rgb(fg))
+                                .child(if line.text.is_empty() {
+                                    " ".to_string()
+                                } else {
+                                    line.text.clone()
+                                });
+                            if let Some(bg) = bg {
+                                row_div = row_div.bg(rgb(bg));
+                            }
+                            row_div
+                        }
+                        diff::SplitRow::Pair(old, new) => div()
+                            .h_flex()
+                            .h(px(17.))
+                            .flex_shrink_0()
+                            .w_full()
+                            .child(split_cell(
+                                old.as_ref(),
+                                old.as_ref().and_then(|line| line.old_lineno),
+                            ))
+                            .child(div().w(px(1.)).flex_shrink_0().bg(rgb(LINE)))
+                            .child(split_cell(
+                                new.as_ref(),
+                                new.as_ref().and_then(|line| line.new_lineno),
+                            )),
+                    }
+                }))
+        } else {
+            div()
+                .v_flex()
+                .w_full()
+                .py_2()
+                .font_family(MONO_FONT)
+                .text_size(px(12.))
+                .children(text.lines().map(|line| {
+                    let (fg, bg) = diff_line_colors(line);
+                    let mut row = div()
+                        .h_flex()
+                        .h(px(17.))
+                        .flex_shrink_0()
+                        .px_3()
+                        .whitespace_nowrap()
+                        .text_color(rgb(fg))
+                        .child(if line.is_empty() {
+                            " ".to_string()
+                        } else {
+                            line.to_string()
+                        });
+                    if let Some(bg) = bg {
+                        row = row.bg(rgb(bg));
+                    }
+                    row
+                }))
+        };
         div()
             .v_flex()
             .flex_1()
@@ -2947,33 +3037,7 @@ impl Workbench {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.diff_scroll)
-                    .child(
-                        div()
-                            .v_flex()
-                            .w_full()
-                            .py_2()
-                            .font_family(MONO_FONT)
-                            .text_size(px(12.))
-                            .children(text.lines().map(|line| {
-                                let (fg, bg) = diff_line_colors(line);
-                                let mut row = div()
-                                    .h_flex()
-                                    .h(px(17.))
-                                    .flex_shrink_0()
-                                    .px_3()
-                                    .whitespace_nowrap()
-                                    .text_color(rgb(fg))
-                                    .child(if line.is_empty() {
-                                        " ".to_string()
-                                    } else {
-                                        line.to_string()
-                                    });
-                                if let Some(bg) = bg {
-                                    row = row.bg(rgb(bg));
-                                }
-                                row
-                            })),
-                    ),
+                    .child(body),
             )
     }
 
@@ -3120,6 +3184,53 @@ impl Workbench {
 }
 
 /// diff の行種別ごとの (前景色, 背景色)。
+/// diff の行種別から unified 表示と同じ配色を返す（split 表示用）。
+fn diff_kind_colors(kind: diff::DiffLineKind) -> (u32, Option<u32>) {
+    match kind {
+        diff::DiffLineKind::Added => (0x9ece8a, Some(0x22331d)),
+        diff::DiffLineKind::Removed => (0xe08a7d, Some(0x38231f)),
+        diff::DiffLineKind::HunkHeader => (ACCENT, None),
+        diff::DiffLineKind::FileHeader | diff::DiffLineKind::Meta => (MUTED, None),
+        diff::DiffLineKind::Context => (0xc6cdd8, None),
+    }
+}
+
+/// split 表示の片側セル（行番号 + テキスト）。行が無い側は空セル。
+fn split_cell(line: Option<&diff::DiffLine>, number: Option<usize>) -> Div {
+    let mut cell = div().h_flex().flex_1().min_w_0().h(px(17.)).flex_shrink_0();
+    cell = cell.child(
+        div()
+            .w(px(40.))
+            .flex_shrink_0()
+            .px_2()
+            .text_color(rgb(MUTED))
+            .child(number.map(|n| n.to_string()).unwrap_or_default()),
+    );
+    match line {
+        Some(line) => {
+            let (fg, bg) = diff_kind_colors(line.kind);
+            cell = cell.text_color(rgb(fg));
+            if let Some(bg) = bg {
+                cell = cell.bg(rgb(bg));
+            }
+            cell.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(if line.text.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line.text.clone()
+                    }),
+            )
+        }
+        None => cell.bg(rgb(CANVAS)).child(div().flex_1()),
+    }
+}
+
 fn diff_line_colors(line: &str) -> (u32, Option<u32>) {
     if line.starts_with("diff --git")
         || line.starts_with("index ")
