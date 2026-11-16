@@ -13,6 +13,7 @@ use gpui_kit::*;
 mod agents;
 mod lsp;
 mod terminal;
+mod worktrees;
 
 use terminal::TerminalSession;
 
@@ -199,6 +200,8 @@ pub struct Workbench {
     term_origin: Option<Point<Pixels>>,
     /// エディタ（ツリー＋編集領域）を表示しているか。既定は非表示で、ターミナルがメイン。
     editor_open: bool,
+    /// git worktree の一覧（2件以上あるときだけサイドバーに出す）。
+    worktree_list: Vec<worktrees::Worktree>,
     /// git status の変更ファイル一覧（相対パスと XY ステータス）。
     changes: Vec<ChangedFile>,
     changes_error: Option<String>,
@@ -612,6 +615,7 @@ impl Workbench {
             term_selection: None,
             term_origin: None,
             editor_open: false,
+            worktree_list: Vec::new(),
             changes: Vec::new(),
             changes_error: None,
             diff_target: None,
@@ -724,6 +728,7 @@ impl Workbench {
                 self.session_error = Some(format!("ターミナルを起動できなかった: {error}"));
             }
         }
+        self.worktree_list = worktrees::list_worktrees(&root).unwrap_or_default();
         self.project = Some(root);
         self.refresh_changes();
         self.save_state();
@@ -1581,6 +1586,7 @@ impl Workbench {
                         "フォルダを開いて作業を始める"
                     }),
             )
+            .children(self.worktrees_section(cx))
             .child(self.sessions_section(cx))
             .child(div().flex_1())
             .child(
@@ -1598,6 +1604,69 @@ impl Workbench {
                             .on_click(cx.listener(|this, _, _, cx| this.open_project(cx))),
                     ),
             )
+    }
+
+    /// サイドバーの worktree 一覧（2件以上あるときだけ表示、クリックで切替）。
+    fn worktrees_section(&self, cx: &Context<Self>) -> Option<Div> {
+        if self.worktree_list.len() < 2 {
+            return None;
+        }
+        let current = self.project.clone();
+        let mut section = div().v_flex().child(section_heading("ワークツリー"));
+        for (index, wt) in self.worktree_list.iter().enumerate() {
+            let is_current = current.as_deref() == Some(wt.path.as_path());
+            let folder = wt
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| wt.path.to_string_lossy().into_owned());
+            let label = wt.branch.clone().unwrap_or_else(|| {
+                if wt.detached {
+                    "(detached)".into()
+                } else {
+                    folder.clone()
+                }
+            });
+            let path = wt.path.clone();
+            let mut row = div()
+                .id(("worktree-row", index as u64))
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .mx_2()
+                .px_2()
+                .py(px(5.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(12.))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child(folder),
+                );
+            if is_current {
+                row = row.bg(rgb(SURFACE));
+            } else {
+                row = row
+                    .hover(|style| style.bg(rgb(SURFACE)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.load_project(path.clone());
+                        cx.notify();
+                    }));
+            }
+            section = section.child(row);
+        }
+        Some(section)
     }
 
     /// サイドバーのセッション一覧（クリックで切替、×で終了）と追加ボタン。
