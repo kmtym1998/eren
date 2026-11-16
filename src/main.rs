@@ -12,6 +12,7 @@ use gpui_kit::*;
 
 mod agents;
 mod diff;
+mod links;
 mod lsp;
 mod symbols;
 mod terminal;
@@ -2465,6 +2466,62 @@ impl Workbench {
         Some(out)
     }
 
+    /// ターミナルの (列, 行) にリンクがあれば開く。リンクを処理したら true。
+    fn try_open_link(
+        &mut self,
+        col: usize,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text: String = {
+            let Some(session) = self.terminal() else {
+                return false;
+            };
+            let snapshot = session.snapshot();
+            let Some(line) = snapshot.lines.get(row) else {
+                return false;
+            };
+            line.runs.iter().map(|run| run.text.as_str()).collect()
+        };
+        // セル列（文字数）をバイト位置に直してリンクを探す。
+        let byte_offset: usize = text.chars().take(col).map(|c| c.len_utf8()).sum();
+        let Some(span) = links::find_links(&text)
+            .into_iter()
+            .find(|span| span.start <= byte_offset && byte_offset < span.end)
+        else {
+            return false;
+        };
+        match span.target {
+            links::LinkTarget::Url(url) => {
+                cx.open_url(&url);
+            }
+            links::LinkTarget::FilePath { path, line, column } => {
+                let candidate = PathBuf::from(&path);
+                let resolved = if candidate.is_absolute() {
+                    candidate
+                } else if let Some(root) = &self.project {
+                    root.join(candidate)
+                } else {
+                    candidate
+                };
+                if resolved.is_file() {
+                    let jump = line.map(|l| {
+                        Position::new(
+                            l.saturating_sub(1) as u32,
+                            column.map(|c| c.saturating_sub(1) as u32).unwrap_or(0),
+                        )
+                    });
+                    self.open_path_at(resolved, jump, window, cx);
+                } else {
+                    self.status_message = Some(format!("リンク先のファイルが見つからない: {path}"));
+                    cx.notify();
+                }
+            }
+        }
+        true
+    }
+
     /// セッションを追加する（シェルまたはエージェント）。
     /// セッションを1つ作って末尾に追加する。成功したら true。
     fn spawn_session(&mut self, kind: agents::AgentKind) -> bool {
@@ -2693,6 +2750,10 @@ impl Workbench {
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.terminal_focus.focus(window, cx);
                     let (col, row) = this.cell_from_position(event.position);
+                    // Cmd+クリックはリンク（URL / ファイルパス）を開く。
+                    if event.modifiers.platform && this.try_open_link(col, row, window, cx) {
+                        return;
+                    }
                     this.term_selection = Some((row, col, row, col));
                     cx.notify();
                 }),
