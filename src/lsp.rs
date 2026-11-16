@@ -25,6 +25,14 @@ pub struct LspLocation {
 
 type PendingMap = HashMap<i64, mpsc::Sender<Result<Value, String>>>;
 
+/// 進行中の作業（workDoneProgress）1件。
+#[derive(Clone, Debug)]
+pub struct ProgressEntry {
+    pub title: String,
+    pub message: Option<String>,
+    pub percentage: Option<u64>,
+}
+
 /// 診断の保持・hover・did_close は次のスライス（診断表示 / hover UI）で使う。
 #[allow(dead_code)]
 pub struct LspClient {
@@ -33,6 +41,8 @@ pub struct LspClient {
     pending: Arc<Mutex<PendingMap>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     diagnostics_version: Arc<AtomicU64>,
+    progress: Arc<Mutex<HashMap<String, ProgressEntry>>>,
+    progress_version: Arc<AtomicU64>,
     versions: Mutex<HashMap<String, i64>>,
     next_id: AtomicI64,
     /// initialize の応答に含まれるサーバーの capabilities。
@@ -95,12 +105,17 @@ impl LspClient {
         let diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics_version = Arc::new(AtomicU64::new(0));
+        let progress: Arc<Mutex<HashMap<String, ProgressEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let progress_version = Arc::new(AtomicU64::new(0));
 
         {
             let writer = Arc::clone(&writer);
             let pending = Arc::clone(&pending);
             let diagnostics = Arc::clone(&diagnostics);
             let diagnostics_version = Arc::clone(&diagnostics_version);
+            let progress = Arc::clone(&progress);
+            let progress_version = Arc::clone(&progress_version);
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 while let Some(message) = read_message(&mut reader) {
@@ -140,7 +155,7 @@ impl LspClient {
                             );
                         }
                         (None, Some(method)) => {
-                            // 通知。診断だけ保持する。
+                            // 通知。診断と進捗だけ保持する。
                             if method == "textDocument/publishDiagnostics" {
                                 if let Some(uri) =
                                     message.pointer("/params/uri").and_then(Value::as_str)
@@ -152,6 +167,64 @@ impl LspClient {
                                         .unwrap_or_default();
                                     diagnostics.lock().unwrap().insert(uri.to_string(), list);
                                     diagnostics_version.fetch_add(1, Ordering::SeqCst);
+                                }
+                            } else if method == "$/progress" {
+                                let token = message.pointer("/params/token").map(|token| {
+                                    token
+                                        .as_str()
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| token.to_string())
+                                });
+                                if let (Some(token), Some(value)) =
+                                    (token, message.pointer("/params/value"))
+                                {
+                                    let kind =
+                                        value.get("kind").and_then(Value::as_str).unwrap_or("");
+                                    let mut map = progress.lock().unwrap();
+                                    let changed = match kind {
+                                        "begin" => {
+                                            map.insert(
+                                                token,
+                                                ProgressEntry {
+                                                    title: value
+                                                        .get("title")
+                                                        .and_then(Value::as_str)
+                                                        .unwrap_or_default()
+                                                        .to_string(),
+                                                    message: value
+                                                        .get("message")
+                                                        .and_then(Value::as_str)
+                                                        .map(str::to_string),
+                                                    percentage: value
+                                                        .get("percentage")
+                                                        .and_then(Value::as_u64),
+                                                },
+                                            );
+                                            true
+                                        }
+                                        "report" => {
+                                            if let Some(entry) = map.get_mut(&token) {
+                                                if let Some(message) =
+                                                    value.get("message").and_then(Value::as_str)
+                                                {
+                                                    entry.message = Some(message.to_string());
+                                                }
+                                                if let Some(percentage) =
+                                                    value.get("percentage").and_then(Value::as_u64)
+                                                {
+                                                    entry.percentage = Some(percentage);
+                                                }
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        "end" => map.remove(&token).is_some(),
+                                        _ => false,
+                                    };
+                                    if changed {
+                                        progress_version.fetch_add(1, Ordering::SeqCst);
+                                    }
                                 }
                             }
                         }
@@ -167,6 +240,8 @@ impl LspClient {
             pending,
             diagnostics,
             diagnostics_version,
+            progress,
+            progress_version,
             versions: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             capabilities: Value::Null,
@@ -189,7 +264,8 @@ impl LspClient {
                         "hover": {"contentFormat": ["markdown", "plaintext"]},
                         "publishDiagnostics": {}
                     },
-                    "workspace": {"configuration": true}
+                    "workspace": {"configuration": true},
+                    "window": {"workDoneProgress": true}
                 }
             }),
         )?;
@@ -353,6 +429,19 @@ impl LspClient {
     /// 診断が更新されるたびに増えるカウンタ（UI 側のポーリング用）。
     pub fn diagnostics_version(&self) -> u64 {
         self.diagnostics_version.load(Ordering::SeqCst)
+    }
+
+    /// 進捗が更新されるたびに増えるカウンタ（UI 側のポーリング用）。
+    pub fn progress_version(&self) -> u64 {
+        self.progress_version.load(Ordering::SeqCst)
+    }
+
+    /// 進行中の作業一覧（タイトル順）。
+    pub fn progress_snapshot(&self) -> Vec<ProgressEntry> {
+        let mut entries: Vec<ProgressEntry> =
+            self.progress.lock().unwrap().values().cloned().collect();
+        entries.sort_by(|a, b| a.title.cmp(&b.title));
+        entries
     }
 
     /// uri に対する最新の診断（publishDiagnostics で届いたもの）。

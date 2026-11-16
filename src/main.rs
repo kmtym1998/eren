@@ -221,6 +221,9 @@ pub struct Workbench {
     lsp_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// 起動中（または起動を試みた）言語サーバーの名前。
     lsp_server: Option<&'static str>,
+    /// 開いているファイルのディスク上の状態（パス・更新時刻・内容ハッシュ）。
+    /// 外部変更の検知に使う。
+    disk_state: Option<(PathBuf, std::time::SystemTime, u64)>,
     /// LSP に didOpen 済みのファイル。
     lsp_open_docs: HashSet<PathBuf>,
     /// ジャンプ候補（複数ヒット時）とジャンプ元の位置。
@@ -231,6 +234,9 @@ pub struct Workbench {
     /// hover プロバイダへ渡す、現在エディタで開いている Rust ファイル。
     hover_doc: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     /// 現在のファイルの診断（言語サーバーから届いたもの）。
+    /// 言語サーバーの進行中の作業（index 中など）の表示ラベル。
+    lsp_progress: Vec<String>,
+    last_progress_version: u64,
     diag_entries: Vec<DiagEntry>,
     /// 最後に取り込んだ診断カウンタの値。
     last_diag_version: u64,
@@ -388,6 +394,48 @@ fn lsp_server_supports(server: Option<&str>, language: &str) -> bool {
     }
 }
 
+/// セッション種別を保存用キーに変換する。
+fn kind_key(kind: agents::AgentKind) -> &'static str {
+    match kind {
+        agents::AgentKind::Shell => "shell",
+        agents::AgentKind::ClaudeCode => "claude",
+        agents::AgentKind::Codex => "codex",
+        agents::AgentKind::OpenCode => "opencode",
+    }
+}
+
+/// 保存用キーからセッション種別に戻す。
+fn kind_from_key(key: &str) -> Option<agents::AgentKind> {
+    match key {
+        "shell" => Some(agents::AgentKind::Shell),
+        "claude" => Some(agents::AgentKind::ClaudeCode),
+        "codex" => Some(agents::AgentKind::Codex),
+        "opencode" => Some(agents::AgentKind::OpenCode),
+        _ => None,
+    }
+}
+
+/// 状態ファイル（プロジェクトやセッション構成の復元用）の場所。
+fn state_file_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("eren")
+            .join("state.json"),
+    )
+}
+
+/// ファイルの更新時刻と内容ハッシュ（外部変更の検知用）。
+fn read_disk_state(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut hasher, &bytes);
+    Some((mtime, std::hash::Hasher::finish(&hasher)))
+}
+
 /// PATH から実行ファイルを探す。
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
@@ -504,31 +552,43 @@ impl Workbench {
                 }
             });
         // ターミナルの出力更新（Wakeup フラグ）を定期的に拾って再描画する。
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(40))
-                .await;
-            let keep = this
-                .update(cx, |this, cx| {
-                    let mut changed = this.refresh_diagnostics(cx);
-                    for tab in &mut this.sessions {
-                        if tab
-                            .session
-                            .wake
-                            .swap(false, std::sync::atomic::Ordering::SeqCst)
-                        {
+        // ついでに約1秒ごとに、開いているファイルの外部変更もチェックする。
+        cx.spawn_in(window, async move |this, cx| {
+            let mut ticks: u32 = 0;
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(40))
+                    .await;
+                ticks = ticks.wrapping_add(1);
+                let check_disk = ticks.is_multiple_of(25);
+                let keep = this
+                    .update_in(cx, |this, window, cx| {
+                        let mut changed = this.refresh_diagnostics(cx);
+                        if this.refresh_progress(cx) {
                             changed = true;
-                            let text = tab.session.visible_text();
-                            tab.detector.observe(&text);
                         }
-                    }
-                    if changed {
-                        cx.notify();
-                    }
-                })
-                .is_ok();
-            if !keep {
-                break;
+                        for tab in &mut this.sessions {
+                            if tab
+                                .session
+                                .wake
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                changed = true;
+                                let text = tab.session.visible_text();
+                                tab.detector.observe(&text);
+                            }
+                        }
+                        if check_disk && this.check_external_change(window, cx) {
+                            changed = true;
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !keep {
+                    break;
+                }
             }
         })
         .detach();
@@ -566,11 +626,14 @@ impl Workbench {
             lsp: lsp_slot,
             lsp_error: lsp_error_slot,
             lsp_server: None,
+            disk_state: None,
             lsp_open_docs: HashSet::new(),
             goto_candidates: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             hover_doc: hover_doc_slot,
+            lsp_progress: Vec::new(),
+            last_progress_version: 0,
             diag_entries: Vec::new(),
             last_diag_version: 0,
         }
@@ -592,10 +655,13 @@ impl Workbench {
         self.search_results = Vec::new();
         self.search_truncated = false;
         self.pending_position = None;
+        self.disk_state = None;
         self.lsp_open_docs.clear();
         *self.hover_doc.lock().unwrap() = None;
         self.diag_entries = Vec::new();
         self.last_diag_version = 0;
+        self.lsp_progress = Vec::new();
+        self.last_progress_version = 0;
         self.goto_candidates = None;
         self.nav_back.clear();
         self.nav_forward.clear();
@@ -660,6 +726,92 @@ impl Workbench {
         }
         self.project = Some(root);
         self.refresh_changes();
+        self.save_state();
+    }
+
+    /// 現在のレイアウト（プロジェクト、セッション構成、開いているファイル）を
+    /// 状態ファイルに保存する。プロセス自体は復元せず、構成だけを次回起動時に再現する。
+    fn save_state(&self) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let Some(path) = state_file_path() else {
+            return;
+        };
+        let value = serde_json::json!({
+            "project": project,
+            "sessions": self
+                .sessions
+                .iter()
+                .map(|tab| kind_key(tab.detector.kind()))
+                .collect::<Vec<_>>(),
+            "active_session": self.active_session,
+            "editing_file": self.editing_path,
+            "editor_open": self.editor_open,
+        });
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, value.to_string());
+    }
+
+    /// 前回のレイアウトを復元する（CLI 引数でプロジェクト指定がなかったとき）。
+    fn restore_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = state_file_path() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let Some(root) = value
+            .get("project")
+            .and_then(|item| item.as_str())
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+        else {
+            return;
+        };
+        self.load_project(root);
+        // セッション構成を復元する（load_project が作ったシェルは作り直す）。
+        let kinds: Vec<agents::AgentKind> = value
+            .get("sessions")
+            .and_then(|item| item.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().and_then(kind_from_key))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !kinds.is_empty() {
+            for tab in self.sessions.drain(..) {
+                tab.session.shutdown();
+            }
+            self.active_session = 0;
+            for kind in &kinds {
+                self.spawn_session(*kind);
+            }
+            let active = value
+                .get("active_session")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0) as usize;
+            self.active_session = active.min(self.sessions.len().saturating_sub(1));
+        }
+        if let Some(file) = value
+            .get("editing_file")
+            .and_then(|item| item.as_str())
+            .map(PathBuf::from)
+            .filter(|file| file.is_file())
+        {
+            self.open_path(file, window, cx);
+        }
+        if let Some(editor_open) = value.get("editor_open").and_then(|item| item.as_bool()) {
+            self.editor_open = editor_open;
+        }
+        cx.notify();
     }
 
     /// git status を読み直して変更一覧を更新する。
@@ -833,6 +985,7 @@ impl Workbench {
         }
         // 診断表示は新しいファイル用に取り直す。
         self.last_diag_version = u64::MAX;
+        self.disk_state = read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
         self.editing_path = Some(path);
         self.dirty = false;
         if let Some(position) = jump {
@@ -843,6 +996,7 @@ impl Workbench {
             let focus_handle = self.editor.focus_handle(cx);
             focus_handle.focus(window, cx);
         }
+        self.save_state();
     }
 
     /// 編集中のファイルを保存する。保存不要・保存成功なら true、失敗なら false。
@@ -857,6 +1011,8 @@ impl Workbench {
         match std::fs::write(&path, text) {
             Ok(()) => {
                 self.dirty = false;
+                self.disk_state =
+                    read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
                 self.status_message = Some("保存した".into());
                 self.refresh_changes();
                 cx.notify();
@@ -872,6 +1028,74 @@ impl Workbench {
 
     fn save_file(&mut self, cx: &mut Context<Self>) {
         self.save_current(cx);
+    }
+
+    /// 開いているファイルが外部で変更されていたら追随する（約1秒ごとに呼ばれる）。
+    /// 未保存の変更がなければ自動で読み直し、あれば上書きせず警告だけ出す。
+    /// 画面に影響する変更をしたら true。
+    fn check_external_change(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(path) = self.editing_path.clone() else {
+            return false;
+        };
+        if self.diff_target.is_some() {
+            return false;
+        }
+        let Some((stamp_path, mtime, hash)) = self.disk_state.clone() else {
+            return false;
+        };
+        if stamp_path != path {
+            return false;
+        }
+        match read_disk_state(&path) {
+            None => {
+                // 削除された。繰り返し知らせないよう記録を消して一度だけ伝える。
+                self.disk_state = None;
+                self.status_message = Some("開いているファイルが外部で削除された".into());
+                true
+            }
+            Some((now_mtime, now_hash)) => {
+                if now_mtime == mtime && now_hash == hash {
+                    return false;
+                }
+                if self.dirty {
+                    // 同じ変更で繰り返し知らせないよう、新しい状態を記録しておく。
+                    self.disk_state = Some((path, now_mtime, now_hash));
+                    self.status_message = Some(
+                        "ファイルが外部で変更された（未保存の変更があるため読み直していない）"
+                            .into(),
+                    );
+                    true
+                } else {
+                    self.reload_current_file(window, cx);
+                    true
+                }
+            }
+        }
+    }
+
+    /// 現在のファイルをディスクから読み直す（カーソル位置は可能な範囲で保つ）。
+    fn reload_current_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.editing_path.clone() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        if bytes.iter().take(8192).any(|b| *b == 0) {
+            return;
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let cursor = self.editor.read(cx).cursor_position();
+        self.editor.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.set_cursor_position(cursor, window, cx);
+        });
+        // set_value で発火した Change により dirty が立っているので、ここで下ろす。
+        self.dirty = false;
+        self.disk_state = read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
+        self.last_diag_version = u64::MAX;
+        self.status_message = Some("外部で変更されたため読み直した".into());
+        cx.notify();
     }
 
     /// 確認バーで「保存して開く」が選ばれたとき。保存に成功したら待機中のファイルを開く。
@@ -976,6 +1200,38 @@ impl Workbench {
     }
 
     /// 言語サーバーから届いた診断を取り込む。変化があれば true。
+    /// 言語サーバーの進捗（$/progress）が変わっていたら表示ラベルを取り直す。
+    fn refresh_progress(&mut self, _cx: &App) -> bool {
+        let client = self.lsp.lock().unwrap().clone();
+        let Some(client) = client else {
+            if self.lsp_progress.is_empty() {
+                return false;
+            }
+            self.lsp_progress = Vec::new();
+            return true;
+        };
+        let version = client.progress_version();
+        if version == self.last_progress_version {
+            return false;
+        }
+        self.last_progress_version = version;
+        self.lsp_progress = client
+            .progress_snapshot()
+            .iter()
+            .map(|entry| {
+                let mut label = entry.title.clone();
+                if let Some(percentage) = entry.percentage {
+                    label.push_str(&format!(" {percentage}%"));
+                }
+                if let Some(message) = &entry.message {
+                    label.push_str(&format!(": {message}"));
+                }
+                label
+            })
+            .collect();
+        true
+    }
+
     fn refresh_diagnostics(&mut self, cx: &App) -> bool {
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else {
@@ -1909,6 +2165,7 @@ impl Workbench {
         } else {
             self.terminal_focus.focus(window, cx);
         }
+        self.save_state();
         cx.notify();
     }
 
@@ -1976,14 +2233,10 @@ impl Workbench {
     }
 
     /// セッションを追加する（シェルまたはエージェント）。
-    fn add_session(
-        &mut self,
-        kind: agents::AgentKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// セッションを1つ作って末尾に追加する。成功したら true。
+    fn spawn_session(&mut self, kind: agents::AgentKind) -> bool {
         let Some(root) = self.project.clone() else {
-            return;
+            return false;
         };
         let base_title = kind.title();
         let count = self
@@ -2009,14 +2262,27 @@ impl Workbench {
                     session,
                     detector: agents::StatusDetector::new(kind),
                 });
-                self.active_session = self.sessions.len() - 1;
                 self.session_error = None;
-                self.term_selection = None;
-                self.terminal_focus.focus(window, cx);
+                true
             }
             Err(error) => {
                 self.session_error = Some(format!("セッションを起動できなかった: {error}"));
+                false
             }
+        }
+    }
+
+    fn add_session(
+        &mut self,
+        kind: agents::AgentKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.spawn_session(kind) {
+            self.active_session = self.sessions.len() - 1;
+            self.term_selection = None;
+            self.terminal_focus.focus(window, cx);
+            self.save_state();
         }
         cx.notify();
     }
@@ -2026,6 +2292,7 @@ impl Workbench {
             self.active_session = index;
             self.term_selection = None;
             self.terminal_focus.focus(window, cx);
+            self.save_state();
             cx.notify();
         }
     }
@@ -2042,6 +2309,7 @@ impl Workbench {
         } else if index < self.active_session {
             self.active_session -= 1;
         }
+        self.save_state();
         cx.notify();
     }
 
@@ -2727,6 +2995,15 @@ impl Render for Workbench {
                                 "プロジェクトを選択して開始"
                             }),
                     )
+                    .children(if self.lsp_progress.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            div()
+                                .text_color(rgb(ACCENT))
+                                .child(format!("LSP: {}", self.lsp_progress.join(" / "))),
+                        )
+                    })
                     .child(format!("開発版  {}", env!("CARGO_PKG_VERSION"))),
             )
     }
@@ -2850,6 +3127,8 @@ fn main() {
                         let mut workbench = Workbench::new(window, cx);
                         if let Some(root) = initial_project {
                             workbench.load_project(root);
+                        } else {
+                            workbench.restore_state(window, cx);
                         }
                         workbench
                     })
