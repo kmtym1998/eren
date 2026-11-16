@@ -43,6 +43,8 @@ const LINE: u32 = 0x343b47;
 const TEXT: u32 = 0xe2e7ef;
 const MUTED: u32 = 0x98a3b4;
 const ACCENT: u32 = 0xb4c9ee;
+/// ターミナルの選択範囲の背景色。
+const SELECT_BG: u32 = 0x3d4c6e;
 
 /// ファイルツリーの1エントリ。フォルダの children は開いたときに遅延で読む。
 struct TreeEntry {
@@ -191,6 +193,10 @@ pub struct Workbench {
     active_session: usize,
     session_error: Option<String>,
     terminal_focus: FocusHandle,
+    /// ターミナルの選択範囲 (開始行, 開始列, 終了行, 終了列)。スナップショット座標。
+    term_selection: Option<(usize, usize, usize, usize)>,
+    /// ターミナル表示領域の原点（マウス座標→セルの変換用、canvas で実測）。
+    term_origin: Option<Point<Pixels>>,
     /// エディタ（ツリー＋編集領域）を表示しているか。既定は非表示で、ターミナルがメイン。
     editor_open: bool,
     /// git status の変更ファイル一覧（相対パスと XY ステータス）。
@@ -508,6 +514,8 @@ impl Workbench {
             active_session: 0,
             session_error: None,
             terminal_focus: cx.focus_handle(),
+            term_selection: None,
+            term_origin: None,
             editor_open: false,
             changes: Vec::new(),
             changes_error: None,
@@ -578,6 +586,7 @@ impl Workbench {
             tab.session.shutdown();
         }
         self.active_session = 0;
+        self.term_selection = None;
         match TerminalSession::new(&root, 100, 30) {
             Ok(session) => {
                 self.sessions.push(SessionTab {
@@ -1850,6 +1859,62 @@ impl Workbench {
             .map(|tab| &tab.session)
     }
 
+    /// 正規化した選択範囲 (開始行, 開始列, 終了行, 終了列)。
+    fn selection_range(&self) -> Option<(usize, usize, usize, usize)> {
+        let (sr, sc, er, ec) = self.term_selection?;
+        if (sr, sc) <= (er, ec) {
+            Some((sr, sc, er, ec))
+        } else {
+            Some((er, ec, sr, sc))
+        }
+    }
+
+    /// マウスのウィンドウ座標を表示セル (列, 行) に変換する。
+    fn cell_from_position(&self, position: Point<Pixels>) -> (usize, usize) {
+        let (Some(origin), Some(session)) = (self.term_origin, self.terminal()) else {
+            return (0, 0);
+        };
+        let col = ((position.x - origin.x - px(8.)) / px(terminal::CELL_W)).floor() as i32;
+        let row = ((position.y - origin.y - px(8.)) / px(terminal::CELL_H)).floor() as i32;
+        (
+            col.clamp(0, session.cols as i32 - 1) as usize,
+            row.clamp(0, session.rows as i32 - 1) as usize,
+        )
+    }
+
+    /// 選択範囲のテキスト（行末の空白は除く）。
+    fn selected_text(&self) -> Option<String> {
+        let (sr, sc, er, ec) = self.selection_range()?;
+        let snapshot = self.terminal()?.snapshot();
+        let mut out = String::new();
+        for row in sr..=er {
+            let line = snapshot.lines.get(row)?;
+            let chars: Vec<char> = line.runs.iter().flat_map(|run| run.text.chars()).collect();
+            if chars.is_empty() {
+                if row != er {
+                    out.push('\n');
+                }
+                continue;
+            }
+            let from = if row == sr {
+                sc.min(chars.len() - 1)
+            } else {
+                0
+            };
+            let to = if row == er {
+                ec.min(chars.len() - 1)
+            } else {
+                chars.len() - 1
+            };
+            let slice: String = chars[from..=to].iter().collect();
+            out.push_str(slice.trim_end());
+            if row != er {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
     /// セッションを追加する（シェルまたはエージェント）。
     fn add_session(
         &mut self,
@@ -1886,6 +1951,7 @@ impl Workbench {
                 });
                 self.active_session = self.sessions.len() - 1;
                 self.session_error = None;
+                self.term_selection = None;
                 self.terminal_focus.focus(window, cx);
             }
             Err(error) => {
@@ -1898,6 +1964,7 @@ impl Workbench {
     fn activate_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.sessions.len() {
             self.active_session = index;
+            self.term_selection = None;
             self.terminal_focus.focus(window, cx);
             cx.notify();
         }
@@ -1909,6 +1976,7 @@ impl Workbench {
         }
         let tab = self.sessions.remove(index);
         tab.session.shutdown();
+        self.term_selection = None;
         if self.active_session >= self.sessions.len() {
             self.active_session = self.sessions.len().saturating_sub(1);
         } else if index < self.active_session {
@@ -1918,7 +1986,14 @@ impl Workbench {
     }
 
     /// canvas の実測サイズからターミナルの列数・行数を更新する。
-    fn terminal_resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
+    fn terminal_resize(
+        &mut self,
+        origin: Point<Pixels>,
+        cols: usize,
+        rows: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.term_origin = Some(origin);
         if let Some(session) = self
             .sessions
             .get_mut(self.active_session)
@@ -1926,6 +2001,7 @@ impl Workbench {
         {
             if session.cols != cols || session.rows != rows {
                 session.resize(cols, rows);
+                self.term_selection = None;
                 cx.notify();
             }
         }
@@ -1937,6 +2013,31 @@ impl Workbench {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // コピー（Cmd+C / Ctrl+Shift+C、選択があるとき）とペースト（Cmd+V / Ctrl+Shift+V）。
+        let modifiers = &event.keystroke.modifiers;
+        if modifiers.platform || (modifiers.control && modifiers.shift) {
+            match event.keystroke.key.as_str() {
+                "c" => {
+                    if let Some(text) = self.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                "v" => {
+                    if let Some(item) = cx.read_from_clipboard() {
+                        if let Some(text) = item.text() {
+                            if let Some(session) = self.terminal() {
+                                session.write(text.as_bytes());
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // Shift+PageUp / PageDown は履歴スクロールに使う（シェルへは送らない）。
         if event.keystroke.modifiers.shift {
             let page = match event.keystroke.key.as_str() {
@@ -1957,6 +2058,10 @@ impl Workbench {
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
             if let Some(session) = self.terminal() {
                 session.write(&bytes);
+            }
+            // 入力したら選択は解除する。
+            if self.term_selection.take().is_some() {
+                cx.notify();
             }
             // Ctrl+S などアプリ側のキーバインドへは回さない（ターミナル入力を優先）。
             cx.stop_propagation();
@@ -2024,10 +2129,24 @@ impl Workbench {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.terminal_focus.focus(window, cx);
+                    let (col, row) = this.cell_from_position(event.position);
+                    this.term_selection = Some((row, col, row, col));
+                    cx.notify();
                 }),
             )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if event.pressed_button == Some(MouseButton::Left) && this.term_selection.is_some()
+                {
+                    let (col, row) = this.cell_from_position(event.position);
+                    if let Some(selection) = &mut this.term_selection {
+                        selection.2 = row;
+                        selection.3 = col;
+                    }
+                    cx.notify();
+                }
+            }))
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 let lines = match event.delta {
                     ScrollDelta::Lines(point) => point.y as i32,
@@ -2036,6 +2155,7 @@ impl Workbench {
                 if let Some(session) = this.terminal() {
                     session.scroll(lines);
                 }
+                this.term_selection = None;
                 cx.notify();
             }))
             .child(
@@ -2048,8 +2168,10 @@ impl Workbench {
                             let rows = ((bounds.size.height - px(16.)) / px(terminal::CELL_H))
                                 .floor() as usize;
                             if cols >= 2 && rows >= 1 {
-                                let _ = weak
-                                    .update(cx, |this, cx| this.terminal_resize(cols, rows, cx));
+                                let origin = bounds.origin;
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.terminal_resize(origin, cols, rows, cx)
+                                });
                             }
                         },
                         |_, _, _, _| {},
@@ -2063,21 +2185,43 @@ impl Workbench {
                     .p_2()
                     .font_family(MONO_FONT)
                     .text_size(px(12.5))
-                    .children(snapshot.lines.iter().map(|line| {
+                    .children(snapshot.lines.iter().enumerate().map(|(row_idx, line)| {
+                        // 選択範囲にかかるセルは背景を変える。run を文字単位の
+                        // セグメントに分け直して、選択境界で分割する。
+                        let selection = self.selection_range();
+                        let mut segments: Vec<(String, u32, u32, bool)> = Vec::new();
+                        let mut col = 0usize;
+                        for run in &line.runs {
+                            for ch in run.text.chars() {
+                                let selected = selection.is_some_and(|(sr, sc, er, ec)| {
+                                    (row_idx, col) >= (sr, sc) && (row_idx, col) <= (er, ec)
+                                });
+                                let bg = if selected { SELECT_BG } else { run.bg };
+                                match segments.last_mut() {
+                                    Some((text, fg, sbg, bold))
+                                        if *fg == run.fg && *sbg == bg && *bold == run.bold =>
+                                    {
+                                        text.push(ch);
+                                    }
+                                    _ => segments.push((ch.to_string(), run.fg, bg, run.bold)),
+                                }
+                                col += 1;
+                            }
+                        }
                         div()
                             .h_flex()
                             .h(px(terminal::CELL_H))
                             .flex_shrink_0()
-                            .children(line.runs.iter().map(|run| {
+                            .children(segments.into_iter().map(|(text, fg, bg, bold)| {
                                 let mut run_div = div()
                                     .flex_shrink_0()
                                     .whitespace_nowrap()
-                                    .text_color(rgb(run.fg))
-                                    .child(run.text.clone());
-                                if run.bg != default_bg {
-                                    run_div = run_div.bg(rgb(run.bg));
+                                    .text_color(rgb(fg))
+                                    .child(text);
+                                if bg != default_bg {
+                                    run_div = run_div.bg(rgb(bg));
                                 }
-                                if run.bold {
+                                if bold {
                                     run_div = run_div.font_weight(FontWeight::BOLD);
                                 }
                                 run_div
