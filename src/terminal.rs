@@ -88,6 +88,8 @@ pub struct Snapshot {
     pub default_bg: u32,
     /// 履歴を遡っている行数（0 = 最下部）。
     pub display_offset: usize,
+    /// 表示中のカーソル位置 (列, 行)。履歴表示中やカーソル非表示なら None。
+    pub cursor: Option<(usize, usize)>,
 }
 
 pub struct TerminalSession {
@@ -214,6 +216,11 @@ impl TerminalSession {
             && content.cursor.shape == CursorShape::Block
             && content.display_offset == 0;
         let cursor_point = content.cursor.point;
+        let cursor = if show_cursor && cursor_point.line.0 >= 0 {
+            Some((cursor_point.column.0, cursor_point.line.0 as usize))
+        } else {
+            None
+        };
 
         let resolve = |color: Color, is_fg: bool| -> Rgb {
             let fallback = if is_fg { default_fg } else { default_bg };
@@ -298,6 +305,7 @@ impl TerminalSession {
             lines,
             default_bg: default_bg_u32,
             display_offset: content.display_offset,
+            cursor,
         }
     }
 }

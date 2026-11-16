@@ -202,6 +202,10 @@ pub struct Workbench {
     term_selection: Option<(usize, usize, usize, usize)>,
     /// ターミナル表示領域の原点（マウス座標→セルの変換用、canvas で実測）。
     term_origin: Option<Point<Pixels>>,
+    /// IME の変換中文字列（marked text）。空なら変換していない。
+    ime_text: String,
+    /// 変換中文字列内の選択範囲（バイト範囲）。
+    ime_selection: (usize, usize),
     /// エディタ（ツリー＋編集領域）を表示しているか。既定は非表示で、ターミナルがメイン。
     editor_open: bool,
     /// git worktree の一覧（2件以上あるときだけサイドバーに出す）。
@@ -631,6 +635,8 @@ impl Workbench {
             terminal_focus: cx.focus_handle(),
             term_selection: None,
             term_origin: None,
+            ime_text: String::new(),
+            ime_selection: (0, 0),
             editor_open: false,
             worktree_list: Vec::new(),
             changes: Vec::new(),
@@ -675,6 +681,8 @@ impl Workbench {
         self.diff_target = None;
         self.diff_text = None;
         self.diff_split = false;
+        self.ime_text.clear();
+        self.ime_selection = (0, 0);
         self.search_query = String::new();
         self.search_results = Vec::new();
         self.search_truncated = false;
@@ -2581,6 +2589,9 @@ impl Workbench {
         if index < self.sessions.len() {
             self.active_session = index;
             self.term_selection = None;
+            // 変換途中の文字列はセッションをまたがない。
+            self.ime_text.clear();
+            self.ime_selection = (0, 0);
             self.terminal_focus.focus(window, cx);
             self.save_state();
             cx.notify();
@@ -2631,6 +2642,11 @@ impl Workbench {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // IME 変換中はキーを IME に任せる（確定文字列は入力ハンドラ経由で届く）。
+        // stop_propagation しないことでプラットフォーム側の変換処理が進む。
+        if !self.ime_text.is_empty() {
+            return;
+        }
         // コピー（Cmd+C / Ctrl+Shift+C、選択があるとき）とペースト（Cmd+V / Ctrl+Shift+V）。
         let modifiers = &event.keystroke.modifiers;
         if modifiers.platform || (modifiers.control && modifiers.shift) {
@@ -2735,6 +2751,9 @@ impl Workbench {
         let default_bg = snapshot.default_bg;
         let scrolled_up = snapshot.display_offset > 0;
         let weak = cx.entity().downgrade();
+        // IME 入力ハンドラ登録用（canvas の paint で使う）。
+        let input_focus = self.terminal_focus.clone();
+        let input_entity = cx.entity();
         let body = div()
             .relative()
             .flex_1()
@@ -2796,7 +2815,14 @@ impl Workbench {
                                 });
                             }
                         },
-                        |_, _, _, _| {},
+                        move |bounds, _, window, cx| {
+                            // ターミナルにフォーカスがある間、IME 入力を受け付ける。
+                            window.handle_input(
+                                &input_focus,
+                                ElementInputHandler::new(bounds, input_entity.clone()),
+                                cx,
+                            );
+                        },
                     )
                     .size_full(),
                 ),
@@ -2851,6 +2877,24 @@ impl Workbench {
                     })),
             );
         let mut body = body;
+        if !self.ime_text.is_empty() {
+            if let Some((col, row)) = snapshot.cursor {
+                // 変換中文字列をカーソル位置に重ねて出す（確定前は PTY へ送らない）。
+                body = body.child(
+                    div()
+                        .absolute()
+                        .left(px(8. + col as f32 * terminal::CELL_W))
+                        .top(px(8. + row as f32 * terminal::CELL_H))
+                        .font_family(MONO_FONT)
+                        .text_size(px(12.5))
+                        .bg(rgb(SELECT_BG))
+                        .border_b_1()
+                        .border_color(rgb(ACCENT))
+                        .text_color(rgb(TEXT))
+                        .child(self.ime_text.clone()),
+                );
+            }
+        }
         if scrolled_up {
             body = body.child(
                 div()
@@ -3245,6 +3289,159 @@ impl Workbench {
 }
 
 /// diff の行種別ごとの (前景色, 背景色)。
+/// UTF-16 コードユニット数（IME の範囲指定は UTF-16 基準）。
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
+}
+
+/// UTF-16 位置をバイト位置に変換する（文字の途中なら次の境界に寄せる）。
+fn utf16_to_byte(s: &str, utf16_idx: usize) -> usize {
+    let mut acc = 0usize;
+    for (byte, ch) in s.char_indices() {
+        if acc >= utf16_idx {
+            return byte;
+        }
+        acc += ch.len_utf16();
+    }
+    s.len()
+}
+
+/// バイト位置を UTF-16 位置に変換する（バイト位置は文字境界前提）。
+fn byte_to_utf16(s: &str, byte: usize) -> usize {
+    let mut acc = 0usize;
+    for (idx, ch) in s.char_indices() {
+        if idx >= byte {
+            break;
+        }
+        acc += ch.len_utf16();
+    }
+    acc
+}
+
+/// ターミナルの IME 入力。仮想ドキュメントは変換中文字列のみで、
+/// 確定した文字列はそのまま PTY へ送る。
+impl EntityInputHandler for Workbench {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let start = utf16_to_byte(&self.ime_text, range.start);
+        let end = utf16_to_byte(&self.ime_text, range.end);
+        if start > end {
+            return None;
+        }
+        *adjusted_range =
+            Some(byte_to_utf16(&self.ime_text, start)..byte_to_utf16(&self.ime_text, end));
+        Some(self.ime_text[start..end].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: byte_to_utf16(&self.ime_text, self.ime_selection.0)
+                ..byte_to_utf16(&self.ime_text, self.ime_selection.1),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        if self.ime_text.is_empty() {
+            None
+        } else {
+            Some(0..utf16_len(&self.ime_text))
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ime_text.is_empty() {
+            let text = std::mem::take(&mut self.ime_text);
+            self.ime_selection = (0, 0);
+            if let Some(session) = self.terminal() {
+                session.write(text.as_bytes());
+            }
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 確定文字列（または IME 経由の通常入力）を PTY へ送る。
+        self.ime_text.clear();
+        self.ime_selection = (0, 0);
+        if !text.is_empty() {
+            if let Some(session) = self.terminal() {
+                session.write(text.as_bytes());
+            }
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_text = new_text.to_string();
+        let selection =
+            new_selected_range.unwrap_or_else(|| utf16_len(new_text)..utf16_len(new_text));
+        self.ime_selection = (
+            utf16_to_byte(new_text, selection.start),
+            utf16_to_byte(new_text, selection.end),
+        );
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // 変換候補ウィンドウはターミナルカーソルの位置に出す。
+        if let (Some(origin), Some(session)) = (self.term_origin, self.terminal()) {
+            if let Some((col, row)) = session.snapshot().cursor {
+                return Some(Bounds::new(
+                    point(
+                        origin.x + px(8. + col as f32 * terminal::CELL_W),
+                        origin.y + px(8. + row as f32 * terminal::CELL_H),
+                    ),
+                    size(px(terminal::CELL_W), px(terminal::CELL_H)),
+                ));
+            }
+        }
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 /// diff の行種別から unified 表示と同じ配色を返す（split 表示用）。
 fn diff_kind_colors(kind: diff::DiffLineKind) -> (u32, Option<u32>) {
     match kind {
@@ -3542,4 +3739,37 @@ fn main() {
             .expect("ウィンドウを開けなかった");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{byte_to_utf16, utf16_len, utf16_to_byte};
+
+    #[test]
+    fn utf16_helpers_ascii() {
+        assert_eq!(utf16_len("abc"), 3);
+        assert_eq!(utf16_to_byte("abc", 0), 0);
+        assert_eq!(utf16_to_byte("abc", 2), 2);
+        assert_eq!(utf16_to_byte("abc", 99), 3);
+        assert_eq!(byte_to_utf16("abc", 2), 2);
+        assert_eq!(byte_to_utf16("abc", 3), 3);
+    }
+
+    #[test]
+    fn utf16_helpers_japanese_and_emoji() {
+        // 「あ」は UTF-16 で 1 単位、バイトでは 3。
+        assert_eq!(utf16_len("あいう"), 3);
+        assert_eq!(utf16_to_byte("あいう", 1), 3);
+        assert_eq!(utf16_to_byte("あいう", 3), 9);
+        assert_eq!(byte_to_utf16("あいう", 6), 2);
+        // サロゲートペア（絵文字）は UTF-16 で 2 単位。
+        assert_eq!(utf16_len("a😀b"), 4);
+        assert_eq!(utf16_to_byte("a😀b", 3), 5);
+        assert_eq!(byte_to_utf16("a😀b", 5), 3);
+        // 往復変換。
+        let s = "変換テスト😀x";
+        for byte in (0..=s.len()).filter(|b| s.is_char_boundary(*b)) {
+            assert_eq!(utf16_to_byte(s, byte_to_utf16(s, byte)), byte);
+        }
+    }
 }
