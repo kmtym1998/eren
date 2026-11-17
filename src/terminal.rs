@@ -532,11 +532,11 @@ finally:
 print('protocol-fixture-ok', flush=True)
 "#;
         let command = format!(
-            "exec /usr/bin/python3 -c '{}'",
+            "exec python3 -c '{}'",
             fixture.replace('\'', "'\\''")
         );
-        let a = TerminalSession::new_agent(Path::new("/private/tmp"), 80, 24, &command).unwrap();
-        let b = TerminalSession::new_agent(Path::new("/private/tmp"), 40, 10, &command).unwrap();
+        let a = TerminalSession::new_agent(&std::env::temp_dir(), 80, 24, &command).unwrap();
+        let b = TerminalSession::new_agent(&std::env::temp_dir(), 40, 10, &command).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut success = false;
         while std::time::Instant::now() < deadline {
