@@ -2655,6 +2655,7 @@ impl Workbench {
                 self.editor.update(cx, |state, cx| state.focus(window, cx));
             }
         } else {
+            self.invalidate_lsp_results();
             self.terminal_focus.focus(window, cx);
         }
         self.save_state();
