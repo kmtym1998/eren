@@ -531,10 +531,7 @@ finally:
     termios.tcsetattr(0, termios.TCSANOW, old)
 print('protocol-fixture-ok', flush=True)
 "#;
-        let command = format!(
-            "exec python3 -c '{}'",
-            fixture.replace('\'', "'\\''")
-        );
+        let command = format!("exec python3 -c '{}'", fixture.replace('\'', "'\\''"));
         let a = TerminalSession::new_agent(&std::env::temp_dir(), 80, 24, &command).unwrap();
         let b = TerminalSession::new_agent(&std::env::temp_dir(), 40, 10, &command).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
