@@ -460,6 +460,20 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// 小文字化した検索位置を、エディタが使う元の行の文字単位の列へ戻す。
+fn search_column(line: &str, lowercase_needle: &str) -> Option<u32> {
+    let byte_index = line.to_lowercase().find(lowercase_needle)?;
+    let mut lowercase_start = 0;
+    for (column, ch) in line.chars().enumerate() {
+        let lowercase_len: usize = ch.to_lowercase().map(char::len_utf8).sum();
+        if byte_index < lowercase_start + lowercase_len {
+            return Some(column as u32);
+        }
+        lowercase_start += lowercase_len;
+    }
+    Some(line.chars().count() as u32)
+}
+
 /// 横断検索のヒット1件。
 pub struct SearchMatch {
     path: PathBuf,
@@ -1194,8 +1208,7 @@ impl Workbench {
             }
             let text = String::from_utf8_lossy(&bytes);
             for (index, line) in text.lines().enumerate() {
-                if let Some(byte_idx) = line.to_lowercase().find(&needle) {
-                    let col = line[..byte_idx].chars().count() as u32;
+                if let Some(col) = search_column(line, &needle) {
                     results.push(SearchMatch {
                         rel: path
                             .strip_prefix(&root)
@@ -3743,7 +3756,33 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{byte_to_utf16, utf16_len, utf16_to_byte};
+    use super::{byte_to_utf16, search_column, utf16_len, utf16_to_byte};
+
+    #[test]
+    fn search_maps_lowercase_expansion_to_original_column() {
+        assert_eq!(search_column("İあ", "あ"), Some(1));
+        assert_eq!(search_column("İab", "b"), Some(2));
+        assert_eq!(search_column("İİあ", "あ"), Some(2));
+        assert_eq!(search_column("İあ", "i"), Some(0));
+        assert_eq!(search_column("İあ", "\u{307}"), Some(0));
+        assert_eq!(search_column("İあ", "i\u{307}"), Some(0));
+    }
+
+    #[test]
+    fn search_columns_count_original_characters() {
+        for (line, query, column) in [
+            ("Hello WORLD", "world", 6),
+            ("日本語の検索", "検索", 4),
+            ("a😀b", "b", 2),
+            ("😀あ😀", "あ", 1),
+            ("e\u{301}あ", "あ", 2),
+            ("ΟΣ あ", "ος", 0),
+            ("İΟΣ あ", "あ", 4),
+        ] {
+            assert_eq!(search_column(line, &query.to_lowercase()), Some(column));
+        }
+        assert_eq!(search_column("日本語", "missing"), None);
+    }
 
     #[test]
     fn utf16_helpers_ascii() {
