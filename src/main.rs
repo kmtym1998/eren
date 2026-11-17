@@ -254,8 +254,6 @@ pub struct Workbench {
     /// 開いているファイルのディスク上の状態（パス・更新時刻・内容ハッシュ）。
     /// 外部変更の検知に使う。
     disk_state: Option<(PathBuf, std::time::SystemTime, u64)>,
-    /// LSP に didOpen 済みのファイル。
-    lsp_open_docs: HashSet<PathBuf>,
     /// ジャンプ候補（複数ヒット時）とジャンプ元の位置。
     goto_candidates: Option<(Vec<GotoCandidate>, (PathBuf, Position))>,
     /// シンボル一覧パネル（documentSymbol の結果）。
@@ -703,7 +701,6 @@ impl Workbench {
             lsp_server: None,
             lsp_epoch,
             disk_state: None,
-            lsp_open_docs: HashSet::new(),
             goto_candidates: None,
             symbol_entries: None,
             nav_back: Vec::new(),
@@ -725,7 +722,9 @@ impl Workbench {
         let project_generation = {
             let mut epoch = self.lsp_epoch.lock().unwrap();
             let project = epoch.next_project();
-            *self.lsp.lock().unwrap() = None;
+            if let Some(client) = self.lsp.lock().unwrap().take() {
+                let _ = client.close_document();
+            }
             *self.lsp_error.lock().unwrap() = None;
             project
         };
@@ -748,7 +747,6 @@ impl Workbench {
         self.pending_position = None;
         self.pending_navigation = None;
         self.disk_state = None;
-        self.lsp_open_docs.clear();
         *self.hover_doc.lock().unwrap() = None;
         self.diag_entries = Vec::new();
         self.last_diag_version = 0;
@@ -1087,23 +1085,11 @@ impl Workbench {
             state.set_highlighter(language, cx);
             state.set_value(text.clone(), window, cx);
         });
-        // 言語サーバーが起動していれば、このファイルを開いたことを伝える。
-        let lsp_language = lsp_language_id(&path)
-            .filter(|language| lsp_server_supports(self.lsp_server, language));
-        if let Some(language) = lsp_language {
-            let client = self.lsp.lock().unwrap().clone();
-            if let Some(client) = client {
-                client.did_open(&path, language, &text);
-                self.lsp_open_docs.insert(path.clone());
-            }
-            *self.hover_doc.lock().unwrap() = Some(path.clone());
-        } else {
-            *self.hover_doc.lock().unwrap() = None;
-        }
         // 診断表示は新しいファイル用に取り直す。
         self.last_diag_version = u64::MAX;
         self.disk_state = read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
         self.editing_path = Some(path);
+        self.sync_lsp_document(cx);
         self.dirty = false;
         if let Some(position) = jump {
             self.editor.update(cx, |state, cx| {
@@ -1379,25 +1365,38 @@ impl Workbench {
         self.symbol_entries = None;
     }
 
-    /// 編集内容を言語サーバーへ全文同期する（didOpen 済みのファイルだけ）。
+    /// 起動待ち・状態復元も同じ経路で、最新のエディタ内容を同期する。
+    fn sync_lsp_document(&self, cx: &App) {
+        let client = self.lsp.lock().unwrap().clone();
+        let Some(client) = client else { return };
+        let document = self
+            .editing_path
+            .as_deref()
+            .filter(|_| self.editor_open && self.diff_target.is_none())
+            .and_then(|path| {
+                lsp_language_id(path)
+                    .filter(|language| lsp_server_supports(self.lsp_server, language))
+                    .map(|language| (path, language))
+            });
+        if let Some((path, language)) = document {
+            let text = self.editor.read(cx).text().to_string();
+            let _ = client.sync_document(path, language, &text);
+            *self.hover_doc.lock().unwrap() = Some(path.to_path_buf());
+        } else {
+            let _ = client.close_document();
+            *self.hover_doc.lock().unwrap() = None;
+        }
+    }
+
     fn sync_lsp_change(&mut self, cx: &mut Context<Self>) {
         self.invalidate_lsp_results();
-        let Some(path) = self.editing_path.clone() else {
-            return;
-        };
-        if !self.lsp_open_docs.contains(&path) {
-            return;
-        }
-        let client = self.lsp.lock().unwrap().clone();
-        if let Some(client) = client {
-            let text = self.editor.read(cx).text().to_string();
-            client.did_change(&path, &text);
-        }
+        self.sync_lsp_document(cx);
     }
 
     /// 言語サーバーから届いた診断を取り込む。変化があれば true。
     /// 言語サーバーの進捗（$/progress）が変わっていたら表示ラベルを取り直す。
-    fn refresh_progress(&mut self, _cx: &App) -> bool {
+    fn refresh_progress(&mut self, cx: &App) -> bool {
+        self.sync_lsp_document(cx);
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else {
             if self.lsp_progress.is_empty() {
@@ -1477,6 +1476,7 @@ impl Workbench {
         if self.diff_target.is_some() {
             return;
         }
+        self.sync_lsp_document(cx);
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else {
             if let Some(error) = self.lsp_error.lock().unwrap().clone() {
@@ -1544,6 +1544,7 @@ impl Workbench {
         if self.diff_target.is_some() {
             return;
         }
+        self.sync_lsp_document(cx);
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else {
             if let Some(error) = self.lsp_error.lock().unwrap().clone() {
@@ -2363,6 +2364,7 @@ impl Workbench {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.invalidate_lsp_results();
                         this.editor_open = false;
+                        this.sync_lsp_document(cx);
                         this.terminal_focus.focus(window, cx);
                         cx.notify();
                     })),
@@ -2658,6 +2660,7 @@ impl Workbench {
             self.invalidate_lsp_results();
             self.terminal_focus.focus(window, cx);
         }
+        self.sync_lsp_document(cx);
         self.save_state();
         cx.notify();
     }
