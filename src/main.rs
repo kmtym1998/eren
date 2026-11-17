@@ -251,6 +251,7 @@ pub struct Workbench {
     /// 起動中（または起動を試みた）言語サーバーの名前。
     lsp_server: Option<&'static str>,
     lsp_epoch: std::sync::Arc<std::sync::Mutex<LspEpoch>>,
+    last_lsp_sync: std::cell::Cell<Option<(u64, u64)>>,
     /// 開いているファイルのディスク上の状態（パス・更新時刻・内容ハッシュ）。
     /// 外部変更の検知に使う。
     disk_state: Option<(PathBuf, std::time::SystemTime, u64)>,
@@ -700,6 +701,7 @@ impl Workbench {
             lsp_error: lsp_error_slot,
             lsp_server: None,
             lsp_epoch,
+            last_lsp_sync: std::cell::Cell::new(None),
             disk_state: None,
             goto_candidates: None,
             symbol_entries: None,
@@ -1367,6 +1369,10 @@ impl Workbench {
 
     /// 起動待ち・状態復元も同じ経路で、最新のエディタ内容を同期する。
     fn sync_lsp_document(&self, cx: &App) {
+        let stamp = self.lsp_epoch.lock().unwrap().document_stamp();
+        if self.last_lsp_sync.get() == Some(stamp) {
+            return;
+        }
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else { return };
         let document = self
@@ -1380,10 +1386,14 @@ impl Workbench {
             });
         if let Some((path, language)) = document {
             let text = self.editor.read(cx).text().to_string();
-            let _ = client.sync_document(path, language, &text);
-            *self.hover_doc.lock().unwrap() = Some(path.to_path_buf());
+            if client.sync_document(path, language, &text).is_ok() {
+                self.last_lsp_sync.set(Some(stamp));
+                *self.hover_doc.lock().unwrap() = Some(path.to_path_buf());
+            }
         } else {
-            let _ = client.close_document();
+            if client.close_document().is_ok() {
+                self.last_lsp_sync.set(Some(stamp));
+            }
             *self.hover_doc.lock().unwrap() = None;
         }
     }
@@ -2652,12 +2662,12 @@ impl Workbench {
 
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_open = !self.editor_open;
+        self.invalidate_lsp_results();
         if self.editor_open {
             if self.editing_path.is_some() {
                 self.editor.update(cx, |state, cx| state.focus(window, cx));
             }
         } else {
-            self.invalidate_lsp_results();
             self.terminal_focus.focus(window, cx);
         }
         self.sync_lsp_document(cx);

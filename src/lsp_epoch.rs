@@ -28,6 +28,10 @@ impl LspEpoch {
         self.project
     }
 
+    pub fn document_stamp(&self) -> (u64, u64) {
+        (self.project, self.document)
+    }
+
     pub fn is_project(&self, project: u64) -> bool {
         self.project == project
     }
