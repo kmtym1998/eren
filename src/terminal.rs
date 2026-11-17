@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -158,7 +158,10 @@ impl Snapshot {
     }
 }
 
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct TerminalSession {
+    id: u64,
     term: Arc<FairMutex<Term<WakeListener>>>,
     sender: EventLoopSender,
     events: mpsc::Receiver<Event>,
@@ -220,6 +223,7 @@ impl TerminalSession {
         let sender = event_loop.channel();
         let _handle = event_loop.spawn();
         Ok(Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             term,
             sender,
             events,
@@ -227,6 +231,19 @@ impl TerminalSession {
             cols,
             rows,
         })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn application_cursor(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
+    pub fn paste(&self, text: &str) {
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        self.write(&paste_bytes(text, bracketed));
     }
 
     /// 画面の可視テキスト（エージェントの状態判定用）。
@@ -291,6 +308,18 @@ impl TerminalSession {
     /// 現在の表示グリッドを行ごとの run 列に変換する。
     pub fn snapshot(&self) -> Snapshot {
         snapshot(&*self.term.lock(), self.cols, self.rows)
+    }
+}
+
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut bytes = b"\x1b[200~".to_vec();
+        // 貼り付け内のESCで終端シーケンスを注入させない。
+        bytes.extend(text.bytes().filter(|byte| *byte != 0x1b));
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        text.as_bytes().to_vec()
     }
 }
 
@@ -672,6 +701,81 @@ mod tests {
         assert_eq!(snapshot(&term, 80, 24).cursor, None);
         Processor::new().advance(&mut term, b"\x1b[?25l");
         assert_eq!(snapshot(&term, 80, 24).cursor, None);
+    }
+
+    #[test]
+    fn bracketed_paste_keeps_newlines_and_removes_escape_injection() {
+        assert_eq!(paste_bytes("a\nb", false), b"a\nb");
+        assert_eq!(paste_bytes("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
+        assert_eq!(
+            paste_bytes("a\x1b[201~b", true),
+            b"\x1b[200~a[201~b\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn real_pty_modes_toggle_cursor_and_paste_bytes() {
+        let fixture = r#"
+import os, select, termios, tty
+old = termios.tcgetattr(0)
+tty.setraw(0)
+try:
+    for stage, enabled in enumerate([False, True, False]):
+        os.write(1, b'\x1b[?1h\x1b[?2004h' if enabled else b'\x1b[?1l\x1b[?2004l')
+        os.write(1, ('mode-ready-%d\r\n' % stage).encode())
+        expected = (b'\x1bOA' if enabled else b'\x1b[A') + (b'\x1b[200~a\nb\x1b[201~' if enabled else b'a\nb')
+        result = b''
+        while len(result) < len(expected):
+            assert select.select([0], [], [], 3)[0], ('timeout', stage, result)
+            result += os.read(0, 1024)
+        assert result == expected, (stage, result, expected)
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, old)
+print('mode-fixture-ok', flush=True)
+"#;
+        let command = format!("exec python3 -c '{}'", fixture.replace('\'', "'\\''"));
+        let sessions = [
+            TerminalSession::new_agent(&std::env::temp_dir(), 80, 24, &command).unwrap(),
+            TerminalSession::new_agent(&std::env::temp_dir(), 40, 10, &command).unwrap(),
+        ];
+        let mut stages = [0; 2];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            for (session, stage) in sessions.iter().zip(&mut stages) {
+                session.process_events();
+                if *stage < 3
+                    && session
+                        .visible_text()
+                        .contains(&format!("mode-ready-{stage}"))
+                {
+                    assert_eq!(session.application_cursor(), *stage == 1);
+                    session.write(
+                        &crate::keystroke_to_bytes(
+                            &crate::Keystroke::parse("up").unwrap(),
+                            session.application_cursor(),
+                        )
+                        .unwrap(),
+                    );
+                    session.paste("a\nb");
+                    *stage += 1;
+                }
+            }
+            if sessions
+                .iter()
+                .all(|s| s.visible_text().contains("mode-fixture-ok"))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let outputs: Vec<_> = sessions.iter().map(TerminalSession::visible_text).collect();
+        for session in &sessions {
+            session.shutdown();
+        }
+        assert!(
+            outputs.iter().all(|text| text.contains("mode-fixture-ok")),
+            "{outputs:?}"
+        );
     }
 
     #[test]
