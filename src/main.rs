@@ -2457,35 +2457,9 @@ impl Workbench {
 
     /// 選択範囲のテキスト（行末の空白は除く）。
     fn selected_text(&self) -> Option<String> {
-        let (sr, sc, er, ec) = self.selection_range()?;
-        let snapshot = self.terminal()?.snapshot();
-        let mut out = String::new();
-        for row in sr..=er {
-            let line = snapshot.lines.get(row)?;
-            let chars: Vec<char> = line.runs.iter().flat_map(|run| run.text.chars()).collect();
-            if chars.is_empty() {
-                if row != er {
-                    out.push('\n');
-                }
-                continue;
-            }
-            let from = if row == sr {
-                sc.min(chars.len() - 1)
-            } else {
-                0
-            };
-            let to = if row == er {
-                ec.min(chars.len() - 1)
-            } else {
-                chars.len() - 1
-            };
-            let slice: String = chars[from..=to].iter().collect();
-            out.push_str(slice.trim_end());
-            if row != er {
-                out.push('\n');
-            }
-        }
-        Some(out)
+        self.terminal()?
+            .snapshot()
+            .selected_text(self.selection_range()?)
     }
 
     /// ターミナルの (列, 行) にリンクがあれば開く。リンクを処理したら true。
@@ -2496,7 +2470,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let text: String = {
+        let (text, byte_offset) = {
             let Some(session) = self.terminal() else {
                 return false;
             };
@@ -2504,10 +2478,11 @@ impl Workbench {
             let Some(line) = snapshot.lines.get(row) else {
                 return false;
             };
-            line.runs.iter().map(|run| run.text.as_str()).collect()
+            let Some(byte_offset) = line.byte_offset(col) else {
+                return false;
+            };
+            (line.text(), byte_offset)
         };
-        // セル列（文字数）をバイト位置に直してリンクを探す。
-        let byte_offset: usize = text.chars().take(col).map(|c| c.len_utf8()).sum();
         let Some(span) = links::find_links(&text)
             .into_iter()
             .find(|span| span.start <= byte_offset && byte_offset < span.end)
@@ -2772,7 +2747,7 @@ impl Workbench {
             .relative()
             .flex_1()
             .min_h_0()
-            .bg(rgb(CANVAS))
+            .bg(rgb(default_bg))
             .overflow_hidden()
             .track_focus(&self.terminal_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -2848,42 +2823,30 @@ impl Workbench {
                     .font_family(MONO_FONT)
                     .text_size(px(12.5))
                     .children(snapshot.lines.iter().enumerate().map(|(row_idx, line)| {
-                        // 選択範囲にかかるセルは背景を変える。run を文字単位の
-                        // セグメントに分け直して、選択境界で分割する。
                         let selection = self.selection_range();
-                        let mut segments: Vec<(String, u32, u32, bool)> = Vec::new();
                         let mut col = 0usize;
-                        for run in &line.runs {
-                            for ch in run.text.chars() {
-                                let selected = selection.is_some_and(|(sr, sc, er, ec)| {
-                                    (row_idx, col) >= (sr, sc) && (row_idx, col) <= (er, ec)
-                                });
-                                let bg = if selected { SELECT_BG } else { run.bg };
-                                match segments.last_mut() {
-                                    Some((text, fg, sbg, bold))
-                                        if *fg == run.fg && *sbg == bg && *bold == run.bold =>
-                                    {
-                                        text.push(ch);
-                                    }
-                                    _ => segments.push((ch.to_string(), run.fg, bg, run.bold)),
-                                }
-                                col += 1;
-                            }
-                        }
                         div()
                             .h_flex()
                             .h(px(terminal::CELL_H))
                             .flex_shrink_0()
-                            .children(segments.into_iter().map(|(text, fg, bg, bold)| {
+                            .children(line.runs.iter().map(|run| {
+                                let selected = selection.is_some_and(|(sr, sc, er, ec)| {
+                                    (row_idx, col + run.columns - 1) >= (sr, sc)
+                                        && (row_idx, col) <= (er, ec)
+                                });
+                                col += run.columns;
+                                let bg = if selected { SELECT_BG } else { run.bg };
                                 let mut run_div = div()
+                                    .w(px(terminal::CELL_W * run.columns as f32))
+                                    .h(px(terminal::CELL_H))
                                     .flex_shrink_0()
                                     .whitespace_nowrap()
-                                    .text_color(rgb(fg))
-                                    .child(text);
+                                    .text_color(rgb(run.fg))
+                                    .child(run.text.clone());
                                 if bg != default_bg {
                                     run_div = run_div.bg(rgb(bg));
                                 }
-                                if bold {
+                                if run.bold {
                                     run_div = run_div.font_weight(FontWeight::BOLD);
                                 }
                                 run_div
@@ -2891,6 +2854,21 @@ impl Workbench {
                     })),
             );
         let mut body = body;
+        if let Some((col, row)) = snapshot.cursor {
+            use alacritty_terminal::vte::ansi::CursorShape;
+            let cursor = div()
+                .absolute()
+                .left(px(8. + col as f32 * terminal::CELL_W))
+                .top(px(8. + row as f32 * terminal::CELL_H))
+                .w(px(terminal::CELL_W))
+                .h(px(terminal::CELL_H));
+            body = match snapshot.cursor_shape {
+                CursorShape::Underline => body.child(cursor.border_b_2().border_color(rgb(TEXT))),
+                CursorShape::Beam => body.child(cursor.border_l_2().border_color(rgb(TEXT))),
+                CursorShape::HollowBlock => body.child(cursor.border_1().border_color(rgb(TEXT))),
+                _ => body,
+            };
+        }
         if !self.ime_text.is_empty() {
             if let Some((col, row)) = snapshot.cursor {
                 // 変換中文字列をカーソル位置に重ねて出す（確定前は PTY へ送らない）。
