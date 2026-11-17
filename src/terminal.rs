@@ -121,7 +121,11 @@ impl Line {
             }
             col += run.columns;
         }
-        text.trim_end_matches(' ').to_string()
+        if self.wrapped {
+            text
+        } else {
+            text.trim_end_matches(' ').to_string()
+        }
     }
 }
 
@@ -402,6 +406,7 @@ fn snapshot<T: EventListener>(term: &Term<T>, cols: usize, rows: usize) -> Snaps
             continue;
         }
         if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+            grid[line as usize][col] = None;
             continue;
         }
         let mut fg = resolve(cell.fg);
@@ -438,22 +443,24 @@ fn snapshot<T: EventListener>(term: &Term<T>, cols: usize, rows: usize) -> Snaps
         });
     }
     let default_bg = rgb_u32(default_bg);
-    let lines =
-        grid.into_iter()
-            .enumerate()
-            .map(|(row, cells)| {
-                let mut cells: Vec<Run> = cells.into_iter().flatten().collect();
-                while cells.last().is_some_and(|cell| {
+    let lines = grid
+        .into_iter()
+        .enumerate()
+        .map(|(row, cells)| {
+            let mut cells: Vec<Run> = cells.into_iter().flatten().collect();
+            while !wrapped[row]
+                && cells.last().is_some_and(|cell| {
                     cell.text.trim_matches(' ').is_empty() && cell.bg == default_bg
-                }) {
-                    cells.pop();
-                }
-                Line {
-                    runs: cells,
-                    wrapped: wrapped[row],
-                }
-            })
-            .collect();
+                })
+            {
+                cells.pop();
+            }
+            Line {
+                runs: cells,
+                wrapped: wrapped[row],
+            }
+        })
+        .collect();
     Snapshot {
         lines,
         default_bg,
@@ -614,6 +621,16 @@ mod tests {
         assert_eq!(view.lines[0].text(), "abc");
         assert_eq!(view.lines[1].text(), "日本");
         assert_eq!(view.selected_text((0, 0, 1, 3)).as_deref(), Some("abc日本"));
+    }
+
+    #[test]
+    fn wrapped_copy_preserves_real_trailing_spaces() {
+        let (mut term, _) = parsed(b"\x1b[?25l");
+        term.resize(TermSize { cols: 4, lines: 3 });
+        Processor::new().advance(&mut term, b"a   b");
+        let view = snapshot(&term, 4, 3);
+        assert_eq!(view.lines[0].text(), "a   ");
+        assert_eq!(view.selected_text((0, 0, 1, 0)).as_deref(), Some("a   b"));
     }
 
     #[test]
