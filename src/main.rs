@@ -185,6 +185,8 @@ fn git_branch(root: &Path) -> Option<String> {
 pub struct Workbench {
     project: Option<PathBuf>,
     picker_error: Option<String>,
+    state_path: Option<PathBuf>,
+    restoring_state: bool,
     tree: Vec<TreeEntry>,
     expanded: HashSet<PathBuf>,
     branch: Option<String>,
@@ -638,6 +640,8 @@ impl Workbench {
         Self {
             project: None,
             picker_error: None,
+            state_path: state_file_path(),
+            restoring_state: false,
             tree: Vec::new(),
             expanded: HashSet::new(),
             branch: None,
@@ -790,11 +794,14 @@ impl Workbench {
 
     /// 現在のレイアウト（プロジェクト、セッション構成、開いているファイル）を
     /// 状態ファイルに保存する。プロセス自体は復元せず、構成だけを次回起動時に再現する。
-    fn save_state(&self) {
+    fn save_state(&mut self) {
+        if self.restoring_state {
+            return;
+        }
         let Some(project) = &self.project else {
             return;
         };
-        let Some(path) = state_file_path() else {
+        let Some(path) = self.state_path.clone() else {
             return;
         };
         let value = serde_json::json!({
@@ -808,15 +815,20 @@ impl Workbench {
             "editing_file": self.editing_path,
             "editor_open": self.editor_open,
         });
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let result = (|| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            file_io::atomic_save(&path, value.to_string().as_bytes())
+        })();
+        if let Err(error) = result {
+            self.status_message = Some(format!("状態を保存できなかった: {error}"));
         }
-        let _ = std::fs::write(path, value.to_string());
     }
 
     /// 前回のレイアウトを復元する（CLI 引数でプロジェクト指定がなかったとき）。
     fn restore_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = state_file_path() else {
+        let Some(path) = self.state_path.clone() else {
             return;
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -833,6 +845,7 @@ impl Workbench {
         else {
             return;
         };
+        self.restoring_state = true;
         self.load_project(root);
         // セッション構成を復元する（load_project が作ったシェルは作り直す）。
         let kinds: Vec<agents::AgentKind> = value
@@ -870,6 +883,8 @@ impl Workbench {
         if let Some(editor_open) = value.get("editor_open").and_then(|item| item.as_bool()) {
             self.editor_open = editor_open;
         }
+        self.restoring_state = false;
+        self.save_state();
         cx.notify();
     }
 
@@ -4036,6 +4051,96 @@ mod tests {
 mod editor_safety_tests {
     use super::Workbench;
     use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn layout_survives_repeated_restore_and_failed_save(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("eren-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "document").unwrap();
+        for editing_file in [None, Some(file.clone())] {
+            let expected = serde_json::json!({"project": dir, "sessions": ["shell", "shell"],
+                "active_session": 1, "editing_file": editing_file, "editor_open": false});
+            std::fs::write(&state_path, expected.to_string()).unwrap();
+            for _ in 0..2 {
+                let (handle, entity) = cx.update(|cx| {
+                    gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                        cx.new(|cx| Workbench::new(window, cx))
+                    })
+                    .unwrap()
+                });
+                cx.update_window(handle, |_, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.state_path = Some(state_path.clone());
+                        this.restore_state(window, cx);
+                        assert_eq!(this.sessions.len(), 2, "{:?}", this.session_error);
+                        assert_eq!(this.active_session, 1);
+                        assert_eq!(this.editing_path, editing_file);
+                        assert!(!this.editor_open);
+                        let saved: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+                        assert_eq!(saved, expected);
+                        // Intermediate persistence must not replace the complete state.
+                        this.restoring_state = true;
+                        this.active_session = 0;
+                        this.save_state();
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(
+                                &std::fs::read(&state_path).unwrap()
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                        this.restoring_state = false;
+                        this.active_session = 1;
+                        let permissions = std::fs::metadata(&state_path).unwrap().permissions();
+                        let mut readonly = permissions.clone();
+                        readonly.set_readonly(true);
+                        std::fs::set_permissions(&state_path, readonly).unwrap();
+                        this.active_session = 0;
+                        this.save_state();
+                        assert!(this
+                            .status_message
+                            .as_ref()
+                            .unwrap()
+                            .contains("状態を保存できなかった"));
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(
+                                &std::fs::read(&state_path).unwrap()
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                        std::fs::set_permissions(&state_path, permissions).unwrap();
+                        for tab in this.sessions.drain(..) {
+                            tab.session.shutdown();
+                        }
+                        window.remove_window();
+                    })
+                })
+                .unwrap();
+            }
+        }
+        std::fs::write(&state_path, "{invalid").unwrap();
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.state_path = Some(state_path.clone());
+                this.restore_state(window, cx);
+                assert!(this.project.is_none());
+                assert_eq!(std::fs::read_to_string(&state_path).unwrap(), "{invalid");
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[gpui_kit::test]
     fn pending_file_navigation_reveals_confirmation(cx: &mut TestAppContext) {
