@@ -16,6 +16,7 @@ mod links;
 mod lsp;
 mod symbols;
 mod terminal;
+mod terminal_input;
 mod worktrees;
 
 use terminal::TerminalSession;
@@ -202,10 +203,7 @@ pub struct Workbench {
     term_selection: Option<(usize, usize, usize, usize)>,
     /// ターミナル表示領域の原点（マウス座標→セルの変換用、canvas で実測）。
     term_origin: Option<Point<Pixels>>,
-    /// IME の変換中文字列（marked text）。空なら変換していない。
-    ime_text: String,
-    /// 変換中文字列内の選択範囲（バイト範囲）。
-    ime_selection: (usize, usize),
+    ime: terminal_input::Composition,
     /// エディタ（ツリー＋編集領域）を表示しているか。既定は非表示で、ターミナルがメイン。
     editor_open: bool,
     /// git worktree の一覧（2件以上あるときだけサイドバーに出す）。
@@ -650,8 +648,7 @@ impl Workbench {
             terminal_focus: cx.focus_handle(),
             term_selection: None,
             term_origin: None,
-            ime_text: String::new(),
-            ime_selection: (0, 0),
+            ime: terminal_input::Composition::default(),
             editor_open: false,
             worktree_list: Vec::new(),
             changes: Vec::new(),
@@ -696,8 +693,7 @@ impl Workbench {
         self.diff_target = None;
         self.diff_text = None;
         self.diff_split = false;
-        self.ime_text.clear();
-        self.ime_selection = (0, 0);
+        // 変換中の確定先は旧セッションのまま保持する。終了済みなら確定時に捨てる。
         self.search_query = String::new();
         self.search_results = Vec::new();
         self.search_truncated = false;
@@ -2578,9 +2574,7 @@ impl Workbench {
         if index < self.sessions.len() {
             self.active_session = index;
             self.term_selection = None;
-            // 変換途中の文字列はセッションをまたがない。
-            self.ime_text.clear();
-            self.ime_selection = (0, 0);
+            // 変換は開始したセッションへ確定する。
             self.terminal_focus.focus(window, cx);
             self.save_state();
             cx.notify();
@@ -2601,6 +2595,21 @@ impl Workbench {
         }
         self.save_state();
         cx.notify();
+    }
+
+    fn commit_terminal_text(&mut self, text: &str) {
+        let active = self.terminal().map(TerminalSession::id);
+        let target = self.ime.take_target(active);
+        if let Some(session) = self
+            .sessions
+            .iter()
+            .map(|tab| &tab.session)
+            .find(|session| Some(session.id()) == target)
+        {
+            if !text.is_empty() {
+                session.write(text.as_bytes());
+            }
+        }
     }
 
     /// canvas の実測サイズからターミナルの列数・行数を更新する。
@@ -2633,7 +2642,7 @@ impl Workbench {
     ) {
         // IME 変換中はキーを IME に任せる（確定文字列は入力ハンドラ経由で届く）。
         // stop_propagation しないことでプラットフォーム側の変換処理が進む。
-        if !self.ime_text.is_empty() {
+        if !self.ime.text.is_empty() {
             return;
         }
         // コピー（Cmd+C / Ctrl+Shift+C、選択があるとき）とペースト（Cmd+V / Ctrl+Shift+V）。
@@ -2651,7 +2660,7 @@ impl Workbench {
                     if let Some(item) = cx.read_from_clipboard() {
                         if let Some(text) = item.text() {
                             if let Some(session) = self.terminal() {
-                                session.write(text.as_bytes());
+                                session.paste(&text);
                             }
                             cx.stop_propagation();
                             return;
@@ -2678,7 +2687,11 @@ impl Workbench {
                 return;
             }
         }
-        if let Some(bytes) = keystroke_to_bytes(&event.keystroke) {
+        if let Some(bytes) = keystroke_to_bytes(
+            &event.keystroke,
+            self.terminal()
+                .is_some_and(TerminalSession::application_cursor),
+        ) {
             if let Some(session) = self.terminal() {
                 session.write(&bytes);
             }
@@ -2869,7 +2882,7 @@ impl Workbench {
                 _ => body,
             };
         }
-        if !self.ime_text.is_empty() {
+        if !self.ime.text.is_empty() && self.terminal().map(TerminalSession::id) == self.ime.owner {
             if let Some((col, row)) = snapshot.cursor {
                 // 変換中文字列をカーソル位置に重ねて出す（確定前は PTY へ送らない）。
                 body = body.child(
@@ -2883,7 +2896,7 @@ impl Workbench {
                         .border_b_1()
                         .border_color(rgb(ACCENT))
                         .text_color(rgb(TEXT))
-                        .child(self.ime_text.clone()),
+                        .child(self.ime.text.clone()),
                 );
             }
         }
@@ -3320,14 +3333,14 @@ impl EntityInputHandler for Workbench {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let start = utf16_to_byte(&self.ime_text, range.start);
-        let end = utf16_to_byte(&self.ime_text, range.end);
+        let start = utf16_to_byte(&self.ime.text, range.start);
+        let end = utf16_to_byte(&self.ime.text, range.end);
         if start > end {
             return None;
         }
         *adjusted_range =
-            Some(byte_to_utf16(&self.ime_text, start)..byte_to_utf16(&self.ime_text, end));
-        Some(self.ime_text[start..end].to_string())
+            Some(byte_to_utf16(&self.ime.text, start)..byte_to_utf16(&self.ime.text, end));
+        Some(self.ime.text[start..end].to_string())
     }
 
     fn selected_text_range(
@@ -3337,8 +3350,8 @@ impl EntityInputHandler for Workbench {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: byte_to_utf16(&self.ime_text, self.ime_selection.0)
-                ..byte_to_utf16(&self.ime_text, self.ime_selection.1),
+            range: byte_to_utf16(&self.ime.text, self.ime.selection.0)
+                ..byte_to_utf16(&self.ime.text, self.ime.selection.1),
             reversed: false,
         })
     }
@@ -3348,22 +3361,17 @@ impl EntityInputHandler for Workbench {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        if self.ime_text.is_empty() {
+        if self.ime.text.is_empty() {
             None
         } else {
-            Some(0..utf16_len(&self.ime_text))
+            Some(0..utf16_len(&self.ime.text))
         }
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.ime_text.is_empty() {
-            let text = std::mem::take(&mut self.ime_text);
-            self.ime_selection = (0, 0);
-            if let Some(session) = self.terminal() {
-                session.write(text.as_bytes());
-            }
-            cx.notify();
-        }
+        let text = self.ime.text.clone();
+        self.commit_terminal_text(&text);
+        cx.notify();
     }
 
     fn replace_text_in_range(
@@ -3373,14 +3381,7 @@ impl EntityInputHandler for Workbench {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 確定文字列（または IME 経由の通常入力）を PTY へ送る。
-        self.ime_text.clear();
-        self.ime_selection = (0, 0);
-        if !text.is_empty() {
-            if let Some(session) = self.terminal() {
-                session.write(text.as_bytes());
-            }
-        }
+        self.commit_terminal_text(text);
         cx.notify();
     }
 
@@ -3392,12 +3393,16 @@ impl EntityInputHandler for Workbench {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.ime_text = new_text.to_string();
         let selection =
             new_selected_range.unwrap_or_else(|| utf16_len(new_text)..utf16_len(new_text));
-        self.ime_selection = (
+        let selection = (
             utf16_to_byte(new_text, selection.start),
             utf16_to_byte(new_text, selection.end),
+        );
+        self.ime.mark(
+            new_text.to_string(),
+            selection,
+            self.terminal().map(TerminalSession::id),
         );
         cx.notify();
     }
@@ -3602,9 +3607,17 @@ impl Render for Workbench {
 }
 
 /// キー入力をターミナルへ送るバイト列に変換する。変換できないもの（Cmd 系など）は None。
-fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
+fn keystroke_to_bytes(ks: &Keystroke, application_cursor: bool) -> Option<Vec<u8>> {
     let mods = &ks.modifiers;
     if mods.platform {
+        return None;
+    }
+    // macOSの日本語入力ソース切替。Ctrl+J単独は改行として維持する。
+    if cfg!(target_os = "macos")
+        && mods.control
+        && mods.shift
+        && matches!(ks.key.as_str(), "j" | "J")
+    {
         return None;
     }
     if mods.control {
@@ -3648,12 +3661,48 @@ fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
             }
         }
         "escape" => &[0x1b],
-        "up" => b"\x1b[A",
-        "down" => b"\x1b[B",
-        "right" => b"\x1b[C",
-        "left" => b"\x1b[D",
-        "home" => b"\x1b[H",
-        "end" => b"\x1b[F",
+        "up" => {
+            if application_cursor {
+                b"\x1bOA"
+            } else {
+                b"\x1b[A"
+            }
+        }
+        "down" => {
+            if application_cursor {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            }
+        }
+        "right" => {
+            if application_cursor {
+                b"\x1bOC"
+            } else {
+                b"\x1b[C"
+            }
+        }
+        "left" => {
+            if application_cursor {
+                b"\x1bOD"
+            } else {
+                b"\x1b[D"
+            }
+        }
+        "home" => {
+            if application_cursor {
+                b"\x1bOH"
+            } else {
+                b"\x1b[H"
+            }
+        }
+        "end" => {
+            if application_cursor {
+                b"\x1bOF"
+            } else {
+                b"\x1b[F"
+            }
+        }
         "pageup" => b"\x1b[5~",
         "pagedown" => b"\x1b[6~",
         "delete" => b"\x1b[3~",
@@ -3736,6 +3785,44 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{byte_to_utf16, search_column, utf16_len, utf16_to_byte};
+
+    #[test]
+    fn terminal_keys_respect_application_cursor_and_control_shortcuts() {
+        use super::{keystroke_to_bytes, Keystroke};
+        for (key, normal, application) in [
+            ("up", "\x1b[A", "\x1bOA"),
+            ("down", "\x1b[B", "\x1bOB"),
+            ("right", "\x1b[C", "\x1bOC"),
+            ("left", "\x1b[D", "\x1bOD"),
+            ("home", "\x1b[H", "\x1bOH"),
+            ("end", "\x1b[F", "\x1bOF"),
+        ] {
+            let key = Keystroke::parse(key).unwrap();
+            assert_eq!(keystroke_to_bytes(&key, false).unwrap(), normal.as_bytes());
+            assert_eq!(
+                keystroke_to_bytes(&key, true).unwrap(),
+                application.as_bytes()
+            );
+        }
+        for (key, bytes) in [
+            ("ctrl-c", b"\x03".as_slice()),
+            ("ctrl-j", b"\x0a"),
+            ("alt-up", b"\x1b\x1bOA"),
+            ("alt-x", b"\x1bx"),
+        ] {
+            let mut stroke = Keystroke::parse(key).unwrap();
+            if key == "alt-x" {
+                stroke.key_char = Some("x".into());
+            }
+            assert_eq!(keystroke_to_bytes(&stroke, true).unwrap(), bytes);
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                keystroke_to_bytes(&Keystroke::parse("ctrl-shift-j").unwrap(), false),
+                None
+            );
+        }
+    }
 
     #[test]
     fn search_maps_lowercase_expansion_to_original_column() {
