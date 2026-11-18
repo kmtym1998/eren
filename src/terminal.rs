@@ -76,18 +76,57 @@ impl Dimensions for TermSize {
     }
 }
 
-/// スタイル付きの文字列の固まり。
+/// 基本文字と結合文字を含む、スタイル付きの描画セル。
 #[derive(Clone, PartialEq)]
 pub struct Run {
     pub text: String,
     pub fg: u32,
     pub bg: u32,
     pub bold: bool,
+    /// この文字と結合文字が占めるセル数。
+    pub columns: usize,
 }
 
-/// 1 行分の run 列。
+/// 1 行分の描画セル。
 pub struct Line {
     pub runs: Vec<Run>,
+    pub wrapped: bool,
+}
+
+impl Line {
+    pub fn text(&self) -> String {
+        self.runs.iter().map(|run| run.text.as_str()).collect()
+    }
+
+    /// セルの両半分を同じ全角文字へ対応付け、結合文字のバイト数も含める。
+    pub fn byte_offset(&self, column: usize) -> Option<usize> {
+        let mut col = 0;
+        let mut byte = 0;
+        for run in &self.runs {
+            if column < col + run.columns {
+                return Some(byte);
+            }
+            col += run.columns;
+            byte += run.text.len();
+        }
+        None
+    }
+
+    fn selected_text(&self, start: usize, end: usize) -> String {
+        let mut col = 0;
+        let mut text = String::new();
+        for run in &self.runs {
+            if col <= end && col + run.columns > start {
+                text.push_str(&run.text);
+            }
+            col += run.columns;
+        }
+        if self.wrapped {
+            text
+        } else {
+            text.trim_end_matches(' ').to_string()
+        }
+    }
 }
 
 /// 画面全体のスナップショット。default_bg は「背景色を塗らなくてよい色」。
@@ -98,6 +137,25 @@ pub struct Snapshot {
     pub display_offset: usize,
     /// 表示中のカーソル位置 (列, 行)。履歴表示中やカーソル非表示なら None。
     pub cursor: Option<(usize, usize)>,
+    pub cursor_shape: CursorShape,
+}
+
+impl Snapshot {
+    pub fn selected_text(&self, range: (usize, usize, usize, usize)) -> Option<String> {
+        let (sr, sc, er, ec) = range;
+        let mut text = String::new();
+        for row in sr..=er {
+            let line = self.lines.get(row)?;
+            text.push_str(&line.selected_text(
+                if row == sr { sc } else { 0 },
+                if row == er { ec } else { usize::MAX },
+            ));
+            if row != er && !line.wrapped {
+                text.push('\n');
+            }
+        }
+        Some(text)
+    }
 }
 
 pub struct TerminalSession {
@@ -312,36 +370,43 @@ fn snapshot<T: EventListener>(term: &Term<T>, cols: usize, rows: usize) -> Snaps
     let default_fg = palette_color(colors, NamedColor::Foreground as usize);
     let default_bg = palette_color(colors, NamedColor::Background as usize);
     let show_cursor = content.mode.contains(TermMode::SHOW_CURSOR)
-        && content.cursor.shape == CursorShape::Block
+        && content.cursor.shape != CursorShape::Hidden
         && content.display_offset == 0;
-    let cursor_point = content.cursor.point;
-    let cursor = if show_cursor && cursor_point.line.0 >= 0 {
-        Some((cursor_point.column.0, cursor_point.line.0 as usize))
-    } else {
-        None
+    let cursor = (show_cursor && content.cursor.point.line.0 >= 0).then_some((
+        content.cursor.point.column.0,
+        content.cursor.point.line.0 as usize,
+    ));
+    let mut wrapped = vec![false; rows];
+    let resolve = |color: Color| match color {
+        Color::Spec(rgb) => rgb,
+        Color::Indexed(index) => palette_color(colors, index as usize),
+        Color::Named(name) => palette_color(colors, name as usize),
     };
-
-    let resolve = |color: Color| -> Rgb {
-        match color {
-            Color::Spec(rgb) => rgb,
-            Color::Indexed(idx) => palette_color(colors, idx as usize),
-            Color::Named(named) => palette_color(colors, named as usize),
-        }
+    let blank = Run {
+        text: " ".into(),
+        fg: rgb_u32(default_fg),
+        bg: rgb_u32(default_bg),
+        bold: false,
+        columns: 1,
     };
-
-    // セルを (文字, fg, bg, bold) のグリッドに展開する
-    let mut grid: Vec<Vec<(char, u32, u32, bool)>> =
-        vec![vec![(' ', rgb_u32(default_fg), rgb_u32(default_bg), false); cols]; rows];
+    let mut grid = vec![vec![Some(blank); cols]; rows];
     for indexed in content.display_iter {
-        let line = indexed.point.line.0;
+        // 履歴の先頭は負の行番号。描画する viewport の行へ戻す。
+        let line = indexed.point.line.0 + content.display_offset as i32;
         let col = indexed.point.column.0;
         if line < 0 || line as usize >= rows || col >= cols {
             continue;
         }
         let cell = indexed.cell;
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-            || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-        {
+        if cell.flags.contains(Flags::WRAPLINE) {
+            wrapped[line as usize] = true;
+        }
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            grid[line as usize][col] = None;
+            continue;
+        }
+        if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+            grid[line as usize][col] = None;
             continue;
         }
         let mut fg = resolve(cell.fg);
@@ -349,58 +414,59 @@ fn snapshot<T: EventListener>(term: &Term<T>, cols: usize, rows: usize) -> Snaps
         if cell.flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
         }
-        if show_cursor && indexed.point == cursor_point {
+        if show_cursor
+            && content.cursor.shape == CursorShape::Block
+            && indexed.point == content.cursor.point
+        {
             std::mem::swap(&mut fg, &mut bg);
         }
-        let ch = if cell.flags.contains(Flags::HIDDEN) || cell.c == '\0' {
-            ' '
+        let columns = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
         } else {
-            cell.c
+            1
         };
-        grid[line as usize][col] = (
-            ch,
-            rgb_u32(fg),
-            rgb_u32(bg),
-            cell.flags.contains(Flags::BOLD),
-        );
+        let text = if cell.flags.contains(Flags::HIDDEN) || cell.c == '\0' {
+            " ".repeat(columns)
+        } else {
+            let mut text = cell.c.to_string();
+            if let Some(chars) = cell.zerowidth() {
+                text.extend(chars);
+            }
+            text
+        };
+        grid[line as usize][col] = Some(Run {
+            text,
+            fg: rgb_u32(fg),
+            bg: rgb_u32(bg),
+            bold: cell.flags.contains(Flags::BOLD),
+            columns,
+        });
     }
-
-    // 行ごとに同じスタイルのセルを run にまとめる（末尾の空白は既定背景なら落とす）
-    let default_bg_u32 = rgb_u32(default_bg);
-    let lines: Vec<Line> = grid
+    let default_bg = rgb_u32(default_bg);
+    let lines = grid
         .into_iter()
-        .map(|cells| {
-            let mut end = cells.len();
-            while end > 0 {
-                let (ch, _, bg, _) = cells[end - 1];
-                if ch == ' ' && bg == default_bg_u32 {
-                    end -= 1;
-                } else {
-                    break;
-                }
+        .enumerate()
+        .map(|(row, cells)| {
+            let mut cells: Vec<Run> = cells.into_iter().flatten().collect();
+            while !wrapped[row]
+                && cells.last().is_some_and(|cell| {
+                    cell.text.trim_matches(' ').is_empty() && cell.bg == default_bg
+                })
+            {
+                cells.pop();
             }
-            let mut runs: Vec<Run> = Vec::new();
-            for (ch, fg, bg, bold) in &cells[..end] {
-                match runs.last_mut() {
-                    Some(run) if run.fg == *fg && run.bg == *bg && run.bold == *bold => {
-                        run.text.push(*ch);
-                    }
-                    _ => runs.push(Run {
-                        text: ch.to_string(),
-                        fg: *fg,
-                        bg: *bg,
-                        bold: *bold,
-                    }),
-                }
+            Line {
+                runs: cells,
+                wrapped: wrapped[row],
             }
-            Line { runs }
         })
         .collect();
     Snapshot {
         lines,
-        default_bg: default_bg_u32,
+        default_bg,
         display_offset: content.display_offset,
         cursor,
+        cursor_shape: content.cursor.shape,
     }
 }
 
@@ -510,6 +576,102 @@ mod tests {
         let view = snapshot(&term, 80, 24);
         assert_eq!(view.lines[0].runs[0].fg, rgb_u32(DEFAULT_FG));
         assert_eq!(view.default_bg, rgb_u32(DEFAULT_BG));
+    }
+
+    #[test]
+    fn wide_and_combining_cells_keep_coordinates_and_selection() {
+        let (term, _) = parsed("\x1b[?25l日本語|e\u{301}A".as_bytes());
+        let view = snapshot(&term, 80, 24);
+        let line = &view.lines[0];
+        assert_eq!(line.text(), "日本語|e\u{301}A");
+        assert_eq!(
+            line.runs.iter().map(|r| r.columns).collect::<Vec<_>>(),
+            [2, 2, 2, 1, 1, 1]
+        );
+        assert_eq!(line.byte_offset(0), Some(0));
+        assert_eq!(line.byte_offset(1), Some(0));
+        assert_eq!(line.byte_offset(6), Some(9));
+        assert_eq!(line.byte_offset(8), Some(13));
+        assert_eq!(view.selected_text((0, 1, 0, 2)).as_deref(), Some("日本"));
+        assert_eq!(
+            view.selected_text((0, 7, 0, 7)).as_deref(),
+            Some("e\u{301}")
+        );
+        assert_eq!(view.selected_text((0, 20, 0, 30)).as_deref(), Some(""));
+        assert_eq!(line.byte_offset(20), None);
+    }
+
+    #[test]
+    fn viewport_history_and_wrapped_lines_copy_correctly() {
+        let (mut term, _) = parsed(b"\x1b[?25lfirst\r\nsecond\r\nthird");
+        term.resize(TermSize { cols: 80, lines: 2 });
+        term.scroll_display(Scroll::Delta(1));
+        let view = snapshot(&term, 80, 2);
+        assert_eq!(view.lines[0].text(), "first");
+        assert_eq!(view.lines[1].text(), "second");
+        assert_eq!(
+            view.selected_text((0, 0, 1, 5)).as_deref(),
+            Some("first\nsecond")
+        );
+        assert!(view.cursor.is_none());
+        let (mut term, _) = parsed(b"\x1b[?25l");
+        term.resize(TermSize { cols: 4, lines: 3 });
+        Processor::new().advance(&mut term, "abc日本".as_bytes());
+        let view = snapshot(&term, 4, 3);
+        assert_eq!(view.lines[0].text(), "abc");
+        assert_eq!(view.lines[1].text(), "日本");
+        assert_eq!(view.selected_text((0, 0, 1, 3)).as_deref(), Some("abc日本"));
+    }
+
+    #[test]
+    fn wrapped_copy_preserves_real_trailing_spaces() {
+        let (mut term, _) = parsed(b"\x1b[?25l");
+        term.resize(TermSize { cols: 4, lines: 3 });
+        Processor::new().advance(&mut term, b"a   b");
+        let view = snapshot(&term, 4, 3);
+        assert_eq!(view.lines[0].text(), "a   ");
+        assert_eq!(view.selected_text((0, 0, 1, 0)).as_deref(), Some("a   b"));
+    }
+
+    #[test]
+    fn links_after_wide_and_combining_characters_use_cell_offsets() {
+        let (term, _) = parsed("\x1b[?25l日 e\u{301} https://example.com".as_bytes());
+        let view = snapshot(&term, 80, 24);
+        let line = &view.lines[0];
+        let text = line.text();
+        let links = crate::links::find_links(&text);
+        let link = links
+            .iter()
+            .find(|l| matches!(l.target, crate::links::LinkTarget::Url(_)))
+            .unwrap();
+        assert_eq!(line.byte_offset(5), Some(link.start));
+        assert!(line.byte_offset(24).is_none());
+    }
+
+    #[test]
+    fn cursor_positions_survive_all_shapes_but_hide_when_requested() {
+        let (mut term, _) = parsed(b"abc");
+        for (sequence, shape) in [
+            (b"\x1b[2 q".as_slice(), CursorShape::Block),
+            (b"\x1b[4 q", CursorShape::Underline),
+            (b"\x1b[6 q", CursorShape::Beam),
+        ] {
+            Processor::new().advance(&mut term, sequence);
+            let view = snapshot(&term, 80, 24);
+            assert_eq!(view.cursor, Some((3, 0)));
+            assert_eq!(view.cursor_shape, shape);
+        }
+        use alacritty_terminal::vte::ansi::Handler;
+        term.set_cursor_shape(CursorShape::HollowBlock);
+        assert_eq!(
+            snapshot(&term, 80, 24).cursor_shape,
+            CursorShape::HollowBlock
+        );
+        assert_eq!(snapshot(&term, 80, 24).cursor, Some((3, 0)));
+        term.set_cursor_shape(CursorShape::Hidden);
+        assert_eq!(snapshot(&term, 80, 24).cursor, None);
+        Processor::new().advance(&mut term, b"\x1b[?25l");
+        assert_eq!(snapshot(&term, 80, 24).cursor, None);
     }
 
     #[test]
