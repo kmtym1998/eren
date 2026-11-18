@@ -13,6 +13,8 @@ use gpui_kit::*;
 mod agents;
 mod diff;
 mod file_io;
+mod git_changes;
+use git_changes::ChangedFile;
 mod links;
 mod lsp;
 mod lsp_epoch;
@@ -146,35 +148,6 @@ fn ensure_children(entries: &mut [TreeEntry], dir: &Path) -> bool {
         }
     }
     false
-}
-
-/// `git status --porcelain=v1 -z` の出力をパースする。
-/// リネーム／コピーは次の NUL 区切りが変更前パスになるため読み飛ばす。
-fn parse_porcelain(stdout: &[u8]) -> Vec<ChangedFile> {
-    let text = String::from_utf8_lossy(stdout);
-    let mut files = Vec::new();
-    let mut entries = text.split('\0').peekable();
-    while let Some(entry) = entries.next() {
-        let mut chars = entry.chars();
-        let (Some(index_status), Some(worktree_status), Some(' ')) =
-            (chars.next(), chars.next(), chars.next())
-        else {
-            continue;
-        };
-        let path: String = chars.collect();
-        if path.is_empty() {
-            continue;
-        }
-        if matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C') {
-            entries.next();
-        }
-        files.push(ChangedFile {
-            path,
-            index_status,
-            worktree_status,
-        });
-    }
-    files
 }
 
 /// .git/HEAD からブランチ名を読む（worktree 等で読めなければ None）。
@@ -507,13 +480,6 @@ pub struct SearchMatch {
     line: u32,
     col: u32,
     text: String,
-}
-
-/// git status --porcelain の1エントリ。
-pub struct ChangedFile {
-    path: String,
-    index_status: char,
-    worktree_status: char,
 }
 
 impl ChangedFile {
@@ -937,68 +903,31 @@ impl Workbench {
         let Some(root) = self.project.clone() else {
             return;
         };
-        let output = std::process::Command::new("git")
-            .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
-            .current_dir(&root)
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
+        match git_changes::status(&root) {
+            Ok(files) => {
                 self.changes_error = None;
-                self.changes = parse_porcelain(&out.stdout);
+                self.changes = files;
             }
-            Ok(out) => {
-                self.changes = Vec::new();
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                self.changes_error = Some(if stderr.contains("not a git repository") {
-                    "Git リポジトリではないため、変更は表示できない".to_string()
-                } else {
-                    "git status を実行できなかった".to_string()
-                });
-            }
-            Err(_) => {
-                self.changes = Vec::new();
-                self.changes_error = Some("git コマンドが見つからない".to_string());
+            Err(error) => {
+                self.changes.clear();
+                self.changes_error = Some(error);
             }
         }
     }
 
-    /// 変更ファイルの diff を開く（エディタ領域に表示する）。
+    /// 変更ファイルの diff を開く（プロジェクトと Git ルートは区別する）。
     fn open_diff(&mut self, file: &ChangedFile, cx: &mut Context<Self>) {
-        let Some(root) = self.project.clone() else {
+        let Some(project) = &self.project else {
             return;
         };
-        let untracked = file.index_status == '?' && file.worktree_status == '?';
-        let output = if untracked {
-            // 未追跡ファイルは /dev/null との diff で全行追加として見せる。
-            std::process::Command::new("git")
-                .args(["diff", "--no-index", "--", "/dev/null", &file.path])
-                .current_dir(&root)
-                .output()
-        } else {
-            std::process::Command::new("git")
-                .args(["diff", "HEAD", "--", &file.path])
-                .current_dir(&root)
-                .output()
-        };
-        match output {
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout).into_owned();
-                self.diff_text = Some(if text.trim().is_empty() {
-                    "差分はない（内容が HEAD と同じか、バイナリファイル）。".to_string()
-                } else {
-                    text
-                });
-                self.invalidate_lsp_results();
-                self.diff_target = Some(file.path.clone());
-                self.editor_open = true;
-            }
-            Err(_) => {
-                self.diff_text = Some("git diff を実行できなかった。".to_string());
-                self.invalidate_lsp_results();
-                self.diff_target = Some(file.path.clone());
-                self.editor_open = true;
-            }
-        }
+        self.diff_text = Some(match git_changes::diff(project, file) {
+            Ok(text) if text.is_empty() => "差分はない（内容が HEAD と同じ）。".into(),
+            Ok(text) => text,
+            Err(error) => error,
+        });
+        self.invalidate_lsp_results();
+        self.diff_target = Some(file.path.clone());
+        self.editor_open = true;
         cx.notify();
     }
 
@@ -3533,11 +3462,7 @@ impl Workbench {
                 }
                 list = list.child(row.on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(file) = this.changes.get(index) {
-                        let file = ChangedFile {
-                            path: file.path.clone(),
-                            index_status: file.index_status,
-                            worktree_status: file.worktree_status,
-                        };
+                        let file = file.clone();
                         this.open_diff(&file, cx);
                     }
                 })));
@@ -4582,6 +4507,7 @@ mod lsp_document_ui_tests {
                     this.open_diff(
                         &ChangedFile {
                             path: "a.rs".into(),
+                            original_path: None,
                             index_status: '?',
                             worktree_status: '?',
                         },
