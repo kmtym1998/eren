@@ -15,6 +15,8 @@ mod diff;
 mod file_io;
 mod links;
 mod lsp;
+mod lsp_epoch;
+use lsp_epoch::{LspEpoch, RequestKind};
 mod symbols;
 mod terminal;
 mod terminal_input;
@@ -248,6 +250,7 @@ pub struct Workbench {
     lsp_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// 起動中（または起動を試みた）言語サーバーの名前。
     lsp_server: Option<&'static str>,
+    lsp_epoch: std::sync::Arc<std::sync::Mutex<LspEpoch>>,
     /// 開いているファイルのディスク上の状態（パス・更新時刻・内容ハッシュ）。
     /// 外部変更の検知に使う。
     disk_state: Option<(PathBuf, std::time::SystemTime, u64)>,
@@ -280,6 +283,7 @@ pub struct GotoCandidate {
 
 /// エディタの hover 表示を言語サーバーへ橋渡しするプロバイダ。
 struct LspHoverProvider {
+    epoch: std::sync::Arc<std::sync::Mutex<LspEpoch>>,
     lsp: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<lsp::LspClient>>>>,
     doc: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
@@ -302,8 +306,14 @@ impl HoverProvider for LspHoverProvider {
             return Task::ready(Ok(None));
         }
         let text = text.to_string();
+        let epoch = self.epoch.clone();
+        let token = epoch.lock().unwrap().request(RequestKind::Hover);
         cx.background_spawn(async move {
-            match client.hover(&path, &text, offset) {
+            let result = client.hover(&path, &text, offset);
+            if !epoch.lock().unwrap().accepts(RequestKind::Hover, token) {
+                return Ok(None);
+            }
+            match result {
                 Ok(Some(value)) => Ok(Some(lsp_types::Hover {
                     contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
                         kind: lsp_types::MarkupKind::Markdown,
@@ -562,6 +572,7 @@ fn panel_header(name: impl Into<SharedString>, glyph: Glyph) -> Div {
 
 impl Workbench {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let lsp_epoch = std::sync::Arc::new(std::sync::Mutex::new(LspEpoch::default()));
         let lsp_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let lsp_error_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let hover_doc_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -578,6 +589,7 @@ impl Workbench {
         });
         {
             let provider = std::rc::Rc::new(LspHoverProvider {
+                epoch: lsp_epoch.clone(),
                 lsp: std::sync::Arc::clone(&lsp_slot),
                 doc: std::sync::Arc::clone(&hover_doc_slot),
             });
@@ -689,6 +701,7 @@ impl Workbench {
             lsp: lsp_slot,
             lsp_error: lsp_error_slot,
             lsp_server: None,
+            lsp_epoch,
             disk_state: None,
             lsp_open_docs: HashSet::new(),
             goto_candidates: None,
@@ -708,6 +721,14 @@ impl Workbench {
         self.pending_close = false;
         self.save_conflict = false;
         self.baseline.clear();
+        // 起動スレッドの確認と書き込みに対して、世代更新とスロット消去を一体化する。
+        let project_generation = {
+            let mut epoch = self.lsp_epoch.lock().unwrap();
+            let project = epoch.next_project();
+            *self.lsp.lock().unwrap() = None;
+            *self.lsp_error.lock().unwrap() = None;
+            project
+        };
         self.tree = read_dir_entries(&root);
         self.branch = git_branch(&root);
         self.expanded.clear();
@@ -737,8 +758,6 @@ impl Workbench {
         self.symbol_entries = None;
         self.nav_back.clear();
         self.nav_forward.clear();
-        *self.lsp.lock().unwrap() = None;
-        *self.lsp_error.lock().unwrap() = None;
         self.lsp_server = None;
         // プロジェクトの種類に応じて言語サーバーをバックグラウンドで起動する。
         let server: Option<(&'static str, String, Vec<String>)> =
@@ -765,9 +784,15 @@ impl Workbench {
             let slot = std::sync::Arc::clone(&self.lsp);
             let error_slot = std::sync::Arc::clone(&self.lsp_error);
             let root_for_thread = root.clone();
+            let epoch = self.lsp_epoch.clone();
             std::thread::spawn(move || {
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                match lsp::LspClient::spawn(&program, &arg_refs, &root_for_thread) {
+                let result = lsp::LspClient::spawn(&program, &arg_refs, &root_for_thread);
+                let epoch = epoch.lock().unwrap();
+                if !epoch.is_project(project_generation) {
+                    return;
+                }
+                match result {
                     Ok(client) => {
                         *slot.lock().unwrap() = Some(std::sync::Arc::new(client));
                     }
@@ -954,11 +979,13 @@ impl Workbench {
                 } else {
                     text
                 });
+                self.invalidate_lsp_results();
                 self.diff_target = Some(file.path.clone());
                 self.editor_open = true;
             }
             Err(_) => {
                 self.diff_text = Some("git diff を実行できなかった。".to_string());
+                self.invalidate_lsp_results();
                 self.diff_target = Some(file.path.clone());
                 self.editor_open = true;
             }
@@ -1017,6 +1044,7 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.editing_path.as_ref() == Some(&path) {
+            self.invalidate_lsp_results();
             if let Some(position) = jump {
                 self.editor.update(cx, |state, cx| {
                     state.set_cursor_position(position, window, cx)
@@ -1037,8 +1065,11 @@ impl Workbench {
                 return false;
             }
         };
+        self.invalidate_lsp_results();
+        *self.hover_doc.lock().unwrap() = None;
         self.baseline = text.as_bytes().to_vec();
         self.save_conflict = false;
+
         self.file_error = None;
         self.status_message = None;
         self.pending_path = None;
@@ -1342,8 +1373,15 @@ impl Workbench {
         cx.notify();
     }
 
+    fn invalidate_lsp_results(&mut self) {
+        self.lsp_epoch.lock().unwrap().next_document();
+        self.goto_candidates = None;
+        self.symbol_entries = None;
+    }
+
     /// 編集内容を言語サーバーへ全文同期する（didOpen 済みのファイルだけ）。
     fn sync_lsp_change(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_lsp_results();
         let Some(path) = self.editing_path.clone() else {
             return;
         };
@@ -1455,10 +1493,20 @@ impl Workbench {
             cx.notify();
             return;
         }
+        self.symbol_entries = None;
+        let token = self.lsp_epoch.lock().unwrap().request(RequestKind::Symbols);
         let task = cx.background_spawn(async move { client.document_symbols(&path) });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, _, cx| {
+                if !this
+                    .lsp_epoch
+                    .lock()
+                    .unwrap()
+                    .accepts(RequestKind::Symbols, token)
+                {
+                    return;
+                }
                 match result {
                     Ok(value) => {
                         let entries = symbols::parse_document_symbols(&value);
@@ -1525,6 +1573,8 @@ impl Workbench {
         let cursor = self.editor.read(cx).cursor_position();
         let offset = char_position_to_offset(&text, cursor.line, cursor.character);
         let origin = (path.clone(), cursor);
+        self.goto_candidates = None;
+        let token = self.lsp_epoch.lock().unwrap().request(RequestKind::Goto);
         let method_owned = method.to_string();
         let label = kind_label.to_string();
         let task = cx.background_spawn(async move {
@@ -1537,7 +1587,14 @@ impl Workbench {
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.apply_goto(result, &label, origin, window, cx);
+                if this
+                    .lsp_epoch
+                    .lock()
+                    .unwrap()
+                    .accepts(RequestKind::Goto, token)
+                {
+                    this.apply_goto(result, &label, origin, window, cx);
+                }
             });
         })
         .detach();
@@ -2304,6 +2361,7 @@ impl Workbench {
                     .text_color(rgb(MUTED))
                     .child(icon(Glyph::X))
                     .on_click(cx.listener(|this, _, window, cx| {
+                        this.invalidate_lsp_results();
                         this.editor_open = false;
                         this.terminal_focus.focus(window, cx);
                         cx.notify();
@@ -2597,6 +2655,7 @@ impl Workbench {
                 self.editor.update(cx, |state, cx| state.focus(window, cx));
             }
         } else {
+            self.invalidate_lsp_results();
             self.terminal_focus.focus(window, cx);
         }
         self.save_state();

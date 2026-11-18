@@ -589,6 +589,88 @@ pub fn uri_to_path(uri: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn mock_client(delay: &str) -> Arc<LspClient> {
+        Arc::new(
+            LspClient::spawn(
+                "python3",
+                &[
+                    "-u",
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/delayed_lsp.py"),
+                    delay,
+                ],
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .expect("mock LSP"),
+        )
+    }
+
+    fn stop_mock(client: &LspClient) {
+        let mut child = client._child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn delayed_startup_cannot_replace_new_project() {
+        use crate::lsp_epoch::LspEpoch;
+        let epoch = Arc::new(Mutex::new(LspEpoch::default()));
+        let slot = Arc::new(Mutex::new(None));
+        let old_project = epoch.lock().unwrap().next_project();
+        let old_epoch = epoch.clone();
+        let old_slot = slot.clone();
+        let old = std::thread::spawn(move || {
+            let client = mock_client("0.2");
+            let epoch = old_epoch.lock().unwrap();
+            if epoch.is_project(old_project) {
+                *old_slot.lock().unwrap() = Some(old_project);
+            }
+            stop_mock(&client);
+        });
+        let new_project = epoch.lock().unwrap().next_project();
+        let client = mock_client("0");
+        {
+            let epoch = epoch.lock().unwrap();
+            assert!(epoch.is_project(new_project));
+            *slot.lock().unwrap() = Some(new_project);
+        }
+        old.join().unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(new_project));
+        stop_mock(&client);
+    }
+
+    #[test]
+    fn delayed_response_is_rejected_after_new_request_and_document_switch() {
+        use crate::lsp_epoch::{LspEpoch, RequestKind};
+        let client = mock_client("0");
+        let mut epoch = LspEpoch::default();
+        let first = epoch.request(RequestKind::Goto);
+        let old_client = client.clone();
+        let old = std::thread::spawn(move || {
+            old_client.goto("textDocument/definition", Path::new("/tmp/a.rs"), "ab", 0)
+        });
+        let second = epoch.request(RequestKind::Goto);
+        let result = client
+            .goto("textDocument/definition", Path::new("/tmp/a.rs"), "ab", 1)
+            .unwrap();
+        assert_eq!(result[0].line, 1);
+        assert!(epoch.accepts(RequestKind::Goto, second));
+        assert_eq!(old.join().unwrap().unwrap()[0].line, 0);
+        assert!(!epoch.accepts(RequestKind::Goto, first));
+        for kind in [RequestKind::Goto, RequestKind::Symbols, RequestKind::Hover] {
+            let token = epoch.request(kind);
+            let old_client = client.clone();
+            let pending = std::thread::spawn(move || {
+                old_client.goto("textDocument/definition", Path::new("/tmp/a.rs"), "ab", 0)
+            });
+            epoch.next_document(); // A → B → A must not revive A's old result.
+            epoch.next_document();
+            assert!(pending.join().unwrap().is_ok());
+            assert!(!epoch.accepts(kind, token));
+        }
+        assert!(!epoch.accepts(RequestKind::Goto, second));
+        stop_mock(&client);
+    }
+
     #[test]
     fn utf16_conversion_roundtrip() {
         let text = "fn main() {\n    let s = \"あ🎉\";\n}\n";
