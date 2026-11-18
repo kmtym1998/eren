@@ -602,10 +602,10 @@ pub fn uri_to_path(uri: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn mock_client(delay: &str) -> Arc<LspClient> {
+    pub(crate) fn mock_client(delay: &str) -> Arc<LspClient> {
         Arc::new(
             LspClient::spawn(
                 "python3",
@@ -620,7 +620,7 @@ mod tests {
         )
     }
 
-    fn stop_mock(client: &LspClient) {
+    pub(crate) fn stop_mock(client: &LspClient) {
         let mut child = client._child.lock().unwrap();
         let _ = child.kill();
         let _ = child.wait();
