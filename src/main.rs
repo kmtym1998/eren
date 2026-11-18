@@ -963,6 +963,9 @@ impl Workbench {
             }
             // 未保存のまま別ファイルへ行くときは、すぐ開かず確認バーを出す。
             if self.dirty {
+                self.editor_open = true;
+                self.diff_target = None;
+                self.diff_text = None;
                 self.pending_project = None;
                 self.pending_close = false;
                 self.pending_path = Some(path);
@@ -1677,6 +1680,9 @@ impl Workbench {
             return;
         }
         if self.dirty {
+            self.editor_open = true;
+            self.diff_target = None;
+            self.diff_text = None;
             self.pending_project = None;
             self.pending_close = false;
             self.pending_path = Some(path);
@@ -4030,6 +4036,68 @@ mod tests {
 mod editor_safety_tests {
     use super::Workbench;
     use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn pending_file_navigation_reveals_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("eren-pending-visible-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                for search in [false, true] {
+                    for diff in [false, true] {
+                        this.open_path(a.clone(), window, cx);
+                        this.editor
+                            .update(cx, |editor, cx| editor.set_value("unsaved", window, cx));
+                        this.dirty = true;
+                        this.editor_open = diff;
+                        this.diff_target = diff.then(|| "a.txt".into());
+                        this.diff_text = diff.then(|| "diff".into());
+                        if search {
+                            this.search_results = vec![super::SearchMatch {
+                                path: b.clone(),
+                                rel: "b.txt".into(),
+                                line: 0,
+                                col: 0,
+                                text: "b".into(),
+                            }];
+                            this.open_search_match(0, window, cx);
+                        } else {
+                            this.on_tree_click(b.clone(), false, window, cx);
+                        }
+                        assert_eq!(this.pending_path.as_ref(), Some(&b));
+                        assert!(
+                            this.editor_open,
+                            "search={search}, diff={diff}: 確認バーが非表示"
+                        );
+                        assert!(
+                            this.diff_target.is_none(),
+                            "search={search}, diff={diff}: diff が確認バーを隠す"
+                        );
+                        assert!(this.diff_text.is_none());
+                        assert_eq!(this.editing_path.as_ref(), Some(&a));
+                        assert!(this.dirty);
+                        assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                        this.cancel_pending();
+                        assert!(this.pending_path.is_none());
+                        assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                    }
+                }
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[gpui_kit::test]
     fn failed_navigation_and_save_keep_the_document(cx: &mut TestAppContext) {
