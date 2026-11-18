@@ -251,11 +251,10 @@ pub struct Workbench {
     /// 起動中（または起動を試みた）言語サーバーの名前。
     lsp_server: Option<&'static str>,
     lsp_epoch: std::sync::Arc<std::sync::Mutex<LspEpoch>>,
+    last_lsp_sync: std::cell::Cell<Option<(u64, u64, bool)>>,
     /// 開いているファイルのディスク上の状態（パス・更新時刻・内容ハッシュ）。
     /// 外部変更の検知に使う。
     disk_state: Option<(PathBuf, std::time::SystemTime, u64)>,
-    /// LSP に didOpen 済みのファイル。
-    lsp_open_docs: HashSet<PathBuf>,
     /// ジャンプ候補（複数ヒット時）とジャンプ元の位置。
     goto_candidates: Option<(Vec<GotoCandidate>, (PathBuf, Position))>,
     /// シンボル一覧パネル（documentSymbol の結果）。
@@ -702,8 +701,8 @@ impl Workbench {
             lsp_error: lsp_error_slot,
             lsp_server: None,
             lsp_epoch,
+            last_lsp_sync: std::cell::Cell::new(None),
             disk_state: None,
-            lsp_open_docs: HashSet::new(),
             goto_candidates: None,
             symbol_entries: None,
             nav_back: Vec::new(),
@@ -725,7 +724,9 @@ impl Workbench {
         let project_generation = {
             let mut epoch = self.lsp_epoch.lock().unwrap();
             let project = epoch.next_project();
-            *self.lsp.lock().unwrap() = None;
+            if let Some(client) = self.lsp.lock().unwrap().take() {
+                let _ = client.close_document();
+            }
             *self.lsp_error.lock().unwrap() = None;
             project
         };
@@ -748,7 +749,6 @@ impl Workbench {
         self.pending_position = None;
         self.pending_navigation = None;
         self.disk_state = None;
-        self.lsp_open_docs.clear();
         *self.hover_doc.lock().unwrap() = None;
         self.diag_entries = Vec::new();
         self.last_diag_version = 0;
@@ -1044,16 +1044,13 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.editing_path.as_ref() == Some(&path) {
-            self.invalidate_lsp_results();
+            self.show_current_editor(cx);
             if let Some(position) = jump {
                 self.editor.update(cx, |state, cx| {
                     state.set_cursor_position(position, window, cx)
                 });
             }
-            self.editor_open = true;
             self.file_error = None;
-            self.diff_target = None;
-            self.diff_text = None;
             return true;
         }
         let text = match file_io::read_document(&path) {
@@ -1087,23 +1084,11 @@ impl Workbench {
             state.set_highlighter(language, cx);
             state.set_value(text.clone(), window, cx);
         });
-        // 言語サーバーが起動していれば、このファイルを開いたことを伝える。
-        let lsp_language = lsp_language_id(&path)
-            .filter(|language| lsp_server_supports(self.lsp_server, language));
-        if let Some(language) = lsp_language {
-            let client = self.lsp.lock().unwrap().clone();
-            if let Some(client) = client {
-                client.did_open(&path, language, &text);
-                self.lsp_open_docs.insert(path.clone());
-            }
-            *self.hover_doc.lock().unwrap() = Some(path.clone());
-        } else {
-            *self.hover_doc.lock().unwrap() = None;
-        }
         // 診断表示は新しいファイル用に取り直す。
         self.last_diag_version = u64::MAX;
         self.disk_state = read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
         self.editing_path = Some(path);
+        self.sync_lsp_document(cx);
         self.dirty = false;
         if let Some(position) = jump {
             self.editor.update(cx, |state, cx| {
@@ -1238,7 +1223,9 @@ impl Workbench {
             state.set_value(text, window, cx);
             state.set_cursor_position(cursor, window, cx);
         });
-        // set_value で発火した Change により dirty が立っているので、ここで下ろす。
+        // set_value は Change を発火しないので、同期世代を明示的に更新する。
+        self.invalidate_lsp_results();
+        self.sync_lsp_document(cx);
         self.dirty = false;
         self.disk_state = read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
         self.last_diag_version = u64::MAX;
@@ -1373,31 +1360,66 @@ impl Workbench {
         cx.notify();
     }
 
+    /// diff や非表示から、保持している文書の編集へ戻る。
+    fn show_current_editor(&mut self, cx: &App) {
+        self.invalidate_lsp_results();
+        self.diff_target = None;
+        self.diff_text = None;
+        self.editor_open = true;
+        self.sync_lsp_document(cx);
+    }
+
     fn invalidate_lsp_results(&mut self) {
         self.lsp_epoch.lock().unwrap().next_document();
         self.goto_candidates = None;
         self.symbol_entries = None;
     }
 
-    /// 編集内容を言語サーバーへ全文同期する（didOpen 済みのファイルだけ）。
-    fn sync_lsp_change(&mut self, cx: &mut Context<Self>) {
-        self.invalidate_lsp_results();
-        let Some(path) = self.editing_path.clone() else {
-            return;
-        };
-        if !self.lsp_open_docs.contains(&path) {
+    /// 起動待ち・状態復元も同じ経路で、最新のエディタ内容を同期する。
+    fn sync_lsp_document(&self, cx: &App) {
+        let (project, document) = self.lsp_epoch.lock().unwrap().document_stamp();
+        let stamp = (
+            project,
+            document,
+            self.editor_open && self.diff_target.is_none(),
+        );
+        if self.last_lsp_sync.get() == Some(stamp) {
             return;
         }
         let client = self.lsp.lock().unwrap().clone();
-        if let Some(client) = client {
+        let Some(client) = client else { return };
+        let document = self
+            .editing_path
+            .as_deref()
+            .filter(|_| self.editor_open && self.diff_target.is_none())
+            .and_then(|path| {
+                lsp_language_id(path)
+                    .filter(|language| lsp_server_supports(self.lsp_server, language))
+                    .map(|language| (path, language))
+            });
+        if let Some((path, language)) = document {
             let text = self.editor.read(cx).text().to_string();
-            client.did_change(&path, &text);
+            if client.sync_document(path, language, &text).is_ok() {
+                self.last_lsp_sync.set(Some(stamp));
+                *self.hover_doc.lock().unwrap() = Some(path.to_path_buf());
+            }
+        } else {
+            if client.close_document().is_ok() {
+                self.last_lsp_sync.set(Some(stamp));
+            }
+            *self.hover_doc.lock().unwrap() = None;
         }
+    }
+
+    fn sync_lsp_change(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_lsp_results();
+        self.sync_lsp_document(cx);
     }
 
     /// 言語サーバーから届いた診断を取り込む。変化があれば true。
     /// 言語サーバーの進捗（$/progress）が変わっていたら表示ラベルを取り直す。
-    fn refresh_progress(&mut self, _cx: &App) -> bool {
+    fn refresh_progress(&mut self, cx: &App) -> bool {
+        self.sync_lsp_document(cx);
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else {
             if self.lsp_progress.is_empty() {
@@ -1477,6 +1499,7 @@ impl Workbench {
         if self.diff_target.is_some() {
             return;
         }
+        self.sync_lsp_document(cx);
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else {
             if let Some(error) = self.lsp_error.lock().unwrap().clone() {
@@ -1544,6 +1567,7 @@ impl Workbench {
         if self.diff_target.is_some() {
             return;
         }
+        self.sync_lsp_document(cx);
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else {
             if let Some(error) = self.lsp_error.lock().unwrap().clone() {
@@ -1703,6 +1727,7 @@ impl Workbench {
         if self.dirty && self.editing_path.as_ref() != Some(&path) {
             self.pending_project = None;
             self.pending_close = false;
+
             self.pending_path = Some(path);
             self.pending_position = Some(position);
             self.pending_navigation = operation;
@@ -1774,9 +1799,7 @@ impl Workbench {
         let (path, position) = (m.path.clone(), Position::new(m.line, m.col));
         // 開いているファイル自身なら、再読込せずカーソルだけ動かす（未保存の編集を守る）。
         if self.editing_path.as_deref() == Some(path.as_path()) {
-            self.diff_target = None;
-            self.diff_text = None;
-            self.editor_open = true;
+            self.show_current_editor(cx);
             self.editor.update(cx, |state, cx| {
                 state.set_cursor_position(position, window, cx);
             });
@@ -2363,6 +2386,7 @@ impl Workbench {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.invalidate_lsp_results();
                         this.editor_open = false;
+                        this.sync_lsp_document(cx);
                         this.terminal_focus.focus(window, cx);
                         cx.notify();
                     })),
@@ -2650,14 +2674,15 @@ impl Workbench {
 
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_open = !self.editor_open;
+        self.invalidate_lsp_results();
         if self.editor_open {
             if self.editing_path.is_some() {
                 self.editor.update(cx, |state, cx| state.focus(window, cx));
             }
         } else {
-            self.invalidate_lsp_results();
             self.terminal_focus.focus(window, cx);
         }
+        self.sync_lsp_document(cx);
         self.save_state();
         cx.notify();
     }
@@ -3297,8 +3322,7 @@ impl Workbench {
                     .text_color(rgb(MUTED))
                     .child(icon(Glyph::X))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.diff_target = None;
-                        this.diff_text = None;
+                        this.show_current_editor(cx);
                         cx.notify();
                     })),
             );
@@ -4512,6 +4536,113 @@ mod editor_safety_tests {
             })
         })
         .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod lsp_document_ui_tests {
+    use super::{lsp, ChangedFile, RequestKind, SearchMatch, Workbench};
+    use gpui_kit::{component::input::Position, AppContext, TestAppContext, WindowOptions};
+    use serde_json::json;
+
+    #[gpui_kit::test]
+    fn diff_return_same_document_navigation_and_reload_resynchronize(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-lsp-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn original() {}\n").unwrap();
+        let client = lsp::tests::mock_client("0");
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.lsp_server = Some("rust-analyzer");
+                *this.lsp.lock().unwrap() = Some(client.clone());
+                this.open_path(path.clone(), window, cx);
+                for mode in ["close-diff", "jump", "search"] {
+                    this.project = Some(dir.clone());
+                    this.open_diff(
+                        &ChangedFile {
+                            path: "a.rs".into(),
+                            index_status: '?',
+                            worktree_status: '?',
+                        },
+                        cx,
+                    );
+                    this.project = None;
+                    this.sync_lsp_document(cx); // poll が didClose を送る。
+                    assert!(this.hover_doc.lock().unwrap().is_none());
+                    match mode {
+                        "close-diff" => this.show_current_editor(cx),
+                        "jump" => this.jump_to(path.clone(), Position::new(0, 0), window, cx),
+                        "search" => {
+                            this.search_results = vec![SearchMatch {
+                                path: path.clone(),
+                                rel: "a.rs".into(),
+                                line: 0,
+                                col: 0,
+                                text: "original".into(),
+                            }];
+                            this.open_search_match(0, window, cx);
+                        }
+                        _ => unreachable!(),
+                    }
+                    this.sync_lsp_document(cx);
+                    assert_eq!(this.hover_doc.lock().unwrap().as_ref(), Some(&path));
+                }
+                let token = this.lsp_epoch.lock().unwrap().request(RequestKind::Goto);
+                std::fs::write(&path, "fn updated() {}\n").unwrap();
+                this.reload_current_file(window, cx);
+                assert!(!this
+                    .lsp_epoch
+                    .lock()
+                    .unwrap()
+                    .accepts(RequestKind::Goto, token));
+                // 変更のない poll で重複通知しない。
+                for _ in 0..3 {
+                    this.sync_lsp_document(cx);
+                }
+            })
+        })
+        .unwrap();
+        let log = client.request("test/notifications", json!({})).unwrap();
+        let log: Vec<_> = log
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["method"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("textDocument/")
+            })
+            .collect();
+        assert_eq!(
+            log.iter()
+                .map(|message| message["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "textDocument/didOpen",
+                "textDocument/didClose",
+                "textDocument/didOpen",
+                "textDocument/didClose",
+                "textDocument/didOpen",
+                "textDocument/didClose",
+                "textDocument/didOpen",
+                "textDocument/didChange"
+            ]
+        );
+        assert_eq!(
+            log.last().unwrap()["params"]["contentChanges"][0]["text"],
+            "fn updated() {}\n"
+        );
+        lsp::tests::stop_mock(&client);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

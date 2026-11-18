@@ -5,6 +5,7 @@ import threading
 import time
 
 lock = threading.Lock()
+notifications = []
 
 
 def respond(message):
@@ -12,6 +13,8 @@ def respond(message):
     if method == "initialize":
         time.sleep(float(sys.argv[1]))
         result = {"capabilities": {"definitionProvider": True}}
+    elif method == "test/notifications":
+        result = list(notifications)
     else:
         character = message.get("params", {}).get("position", {}).get("character", 1)
         if character == 0:
@@ -37,3 +40,5 @@ while True:
     message = json.loads(sys.stdin.buffer.read(length))
     if "id" in message:
         threading.Thread(target=respond, args=(message,)).start()
+    else:
+        notifications.append(message)

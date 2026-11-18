@@ -33,7 +33,13 @@ pub struct ProgressEntry {
     pub percentage: Option<u64>,
 }
 
-/// 診断の保持・hover・did_close は次のスライス（診断表示 / hover UI）で使う。
+#[derive(Default)]
+struct DocumentSync {
+    open: Option<(String, String)>,
+    versions: HashMap<String, i64>,
+}
+
+/// stdio LSP クライアント。
 #[allow(dead_code)]
 pub struct LspClient {
     _child: Mutex<Child>,
@@ -43,7 +49,7 @@ pub struct LspClient {
     diagnostics_version: Arc<AtomicU64>,
     progress: Arc<Mutex<HashMap<String, ProgressEntry>>>,
     progress_version: Arc<AtomicU64>,
-    versions: Mutex<HashMap<String, i64>>,
+    documents: Mutex<DocumentSync>,
     next_id: AtomicI64,
     /// initialize の応答に含まれるサーバーの capabilities。
     pub capabilities: Value,
@@ -242,7 +248,7 @@ impl LspClient {
             diagnostics_version,
             progress,
             progress_version,
-            versions: Mutex::new(HashMap::new()),
+            documents: Mutex::new(DocumentSync::default()),
             next_id: AtomicI64::new(1),
             capabilities: Value::Null,
             root: root.to_path_buf(),
@@ -307,47 +313,57 @@ impl LspClient {
         )
     }
 
-    pub fn did_open(&self, path: &Path, language_id: &str, text: &str) {
+    /// 現在の一文書を同期する。再訪時は close/open、同じ内容の再送は省く。
+    /// 状態更新と通知を同じロック内で実行し、通知順序を保証する。
+    pub fn sync_document(&self, path: &Path, language_id: &str, text: &str) -> Result<(), String> {
         let uri = path_to_uri(path);
-        self.versions.lock().unwrap().insert(uri.clone(), 1);
-        let _ = self.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": language_id,
-                    "version": 1,
-                    "text": text
-                }
-            }),
-        );
+        let mut documents = self.documents.lock().unwrap();
+        if let Some((open_uri, old_text)) = &documents.open {
+            if *open_uri == uri && old_text == text {
+                return Ok(());
+            }
+            if *open_uri != uri {
+                self.notify(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": open_uri}}),
+                )?;
+                self.diagnostics.lock().unwrap().remove(open_uri);
+                documents.open = None;
+            }
+        }
+        let version = documents.versions.get(&uri).copied().unwrap_or(0) + 1;
+        if documents.open.is_some() {
+            self.notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [{"text": text}]
+                }),
+            )?;
+        } else {
+            self.notify(
+                "textDocument/didOpen",
+                json!({"textDocument": {
+                    "uri": uri, "languageId": language_id, "version": version, "text": text
+                }}),
+            )?;
+        }
+        documents.versions.insert(uri.clone(), version);
+        documents.open = Some((uri, text.to_string()));
+        Ok(())
     }
 
-    /// 全文同期で変更を送る。
-    pub fn did_change(&self, path: &Path, text: &str) {
-        let uri = path_to_uri(path);
-        let version = {
-            let mut versions = self.versions.lock().unwrap();
-            let version = versions.entry(uri.clone()).or_insert(1);
-            *version += 1;
-            *version
-        };
-        let _ = self.notify(
-            "textDocument/didChange",
-            json!({
-                "textDocument": {"uri": uri, "version": version},
-                "contentChanges": [{"text": text}]
-            }),
-        );
-    }
-
-    pub fn did_close(&self, path: &Path) {
-        let uri = path_to_uri(path);
-        self.versions.lock().unwrap().remove(&uri);
-        let _ = self.notify(
-            "textDocument/didClose",
-            json!({"textDocument": {"uri": uri}}),
-        );
+    pub fn close_document(&self) -> Result<(), String> {
+        let mut documents = self.documents.lock().unwrap();
+        if let Some((uri, _)) = &documents.open {
+            self.notify(
+                "textDocument/didClose",
+                json!({"textDocument": {"uri": uri}}),
+            )?;
+            self.diagnostics.lock().unwrap().remove(uri);
+            documents.open = None;
+        }
+        Ok(())
     }
 
     /// 定義・実装ジャンプ共通。method は "textDocument/definition" など。
@@ -586,10 +602,10 @@ pub fn uri_to_path(uri: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn mock_client(delay: &str) -> Arc<LspClient> {
+    pub(crate) fn mock_client(delay: &str) -> Arc<LspClient> {
         Arc::new(
             LspClient::spawn(
                 "python3",
@@ -604,10 +620,71 @@ mod tests {
         )
     }
 
-    fn stop_mock(client: &LspClient) {
+    pub(crate) fn stop_mock(client: &LspClient) {
         let mut child = client._child.lock().unwrap();
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn document_notifications_are_balanced_and_versions_survive_reopen() {
+        // 起動前に復元・編集された文書は、準備後に最新の本文を一度だけ送る。
+        let client = mock_client("0.1");
+        let a = Path::new("/tmp/a.rs");
+        let b = Path::new("/tmp/b.rs");
+        client
+            .sync_document(a, "rust", "latest unsaved text")
+            .unwrap();
+        client
+            .sync_document(a, "rust", "latest unsaved text")
+            .unwrap();
+        client.sync_document(a, "rust", "edited again").unwrap();
+        client.sync_document(b, "rust", "file b").unwrap();
+        client.sync_document(a, "rust", "edited again").unwrap();
+        client.close_document().unwrap(); // プロジェクト切り替え・終了。
+        client.close_document().unwrap();
+        let log = client.request("test/notifications", json!({})).unwrap();
+        let log: Vec<_> = log
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["method"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("textDocument/")
+            })
+            .collect();
+        assert_eq!(
+            log.iter()
+                .map(|message| message["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "textDocument/didOpen",
+                "textDocument/didChange",
+                "textDocument/didClose",
+                "textDocument/didOpen",
+                "textDocument/didClose",
+                "textDocument/didOpen",
+                "textDocument/didClose"
+            ]
+        );
+        assert_eq!(
+            log[0]["params"]["textDocument"]["text"],
+            "latest unsaved text"
+        );
+        assert_eq!(
+            log[1]["params"]["contentChanges"][0]["text"],
+            "edited again"
+        );
+        for (index, uri, version) in [(0, a, 1), (1, a, 2), (3, b, 1), (5, a, 3)] {
+            assert_eq!(
+                log[index]["params"]["textDocument"]["uri"],
+                path_to_uri(uri)
+            );
+            assert_eq!(log[index]["params"]["textDocument"]["version"], version);
+        }
+        stop_mock(&client);
     }
 
     #[test]
@@ -711,7 +788,7 @@ mod tests {
         let client = LspClient::spawn("rust-analyzer", &[], &dir).expect("spawn");
         assert!(client.supports("definitionProvider"));
         let main_rs = dir.join("src/main.rs");
-        client.did_open(&main_rs, "rust", source);
+        client.sync_document(&main_rs, "rust", source).unwrap();
         let call_offset = source.rfind("helper()").unwrap();
         let mut locations = Vec::new();
         for _ in 0..30 {
