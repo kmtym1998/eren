@@ -12,6 +12,7 @@ use gpui_kit::*;
 
 mod agents;
 mod diff;
+mod file_io;
 mod links;
 mod lsp;
 mod symbols;
@@ -25,6 +26,7 @@ actions!(
     eren,
     [
         SaveFile,
+        Quit,
         ToggleEditor,
         GotoDefinition,
         GotoImplementation,
@@ -180,9 +182,18 @@ fn git_branch(root: &Path) -> Option<String> {
         .map(|name| name.to_string())
 }
 
+#[derive(Clone)]
+enum PendingNavigation {
+    Jump(PathBuf, Position),
+    Back,
+    Forward,
+}
+
 pub struct Workbench {
     project: Option<PathBuf>,
     picker_error: Option<String>,
+    state_path: Option<PathBuf>,
+    restoring_state: bool,
     tree: Vec<TreeEntry>,
     expanded: HashSet<PathBuf>,
     branch: Option<String>,
@@ -191,6 +202,10 @@ pub struct Workbench {
     dirty: bool,
     /// 未保存のまま切り替えようとした先のファイル。確認バーで決着するまで開かない。
     pending_path: Option<PathBuf>,
+    pending_project: Option<PathBuf>,
+    pending_close: bool,
+    save_conflict: bool,
+    baseline: Vec<u8>,
     file_error: Option<String>,
     status_message: Option<String>,
     _editor_subscription: Subscription,
@@ -225,6 +240,7 @@ pub struct Workbench {
     _search_subscription: Subscription,
     /// 検索結果から開くときのジャンプ先（未保存確認を挟む場合に保持する）。
     pending_position: Option<Position>,
+    pending_navigation: Option<PendingNavigation>,
     /// 言語サーバー（rust-analyzer）のクライアント。起動はバックグラウンドで行い、
     /// 準備ができたらここに入る。
     lsp: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<lsp::LspClient>>>>,
@@ -632,6 +648,8 @@ impl Workbench {
         Self {
             project: None,
             picker_error: None,
+            state_path: state_file_path(),
+            restoring_state: false,
             tree: Vec::new(),
             expanded: HashSet::new(),
             branch: None,
@@ -639,6 +657,10 @@ impl Workbench {
             editing_path: None,
             dirty: false,
             pending_path: None,
+            pending_project: None,
+            pending_close: false,
+            save_conflict: false,
+            baseline: Vec::new(),
             file_error: None,
             status_message: None,
             _editor_subscription: subscription,
@@ -663,6 +685,7 @@ impl Workbench {
             search_truncated: false,
             _search_subscription: search_subscription,
             pending_position: None,
+            pending_navigation: None,
             lsp: lsp_slot,
             lsp_error: lsp_error_slot,
             lsp_server: None,
@@ -681,6 +704,10 @@ impl Workbench {
     }
 
     fn load_project(&mut self, root: PathBuf) {
+        self.pending_project = None;
+        self.pending_close = false;
+        self.save_conflict = false;
+        self.baseline.clear();
         self.tree = read_dir_entries(&root);
         self.branch = git_branch(&root);
         self.expanded.clear();
@@ -698,6 +725,7 @@ impl Workbench {
         self.search_results = Vec::new();
         self.search_truncated = false;
         self.pending_position = None;
+        self.pending_navigation = None;
         self.disk_state = None;
         self.lsp_open_docs.clear();
         *self.hover_doc.lock().unwrap() = None;
@@ -776,11 +804,14 @@ impl Workbench {
 
     /// 現在のレイアウト（プロジェクト、セッション構成、開いているファイル）を
     /// 状態ファイルに保存する。プロセス自体は復元せず、構成だけを次回起動時に再現する。
-    fn save_state(&self) {
+    fn save_state(&mut self) {
+        if self.restoring_state {
+            return;
+        }
         let Some(project) = &self.project else {
             return;
         };
-        let Some(path) = state_file_path() else {
+        let Some(path) = self.state_path.clone() else {
             return;
         };
         let value = serde_json::json!({
@@ -794,15 +825,20 @@ impl Workbench {
             "editing_file": self.editing_path,
             "editor_open": self.editor_open,
         });
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let result = (|| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            file_io::atomic_save(&path, value.to_string().as_bytes())
+        })();
+        if let Err(error) = result {
+            self.status_message = Some(format!("状態を保存できなかった: {error}"));
         }
-        let _ = std::fs::write(path, value.to_string());
     }
 
     /// 前回のレイアウトを復元する（CLI 引数でプロジェクト指定がなかったとき）。
     fn restore_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = state_file_path() else {
+        let Some(path) = self.state_path.clone() else {
             return;
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -819,6 +855,7 @@ impl Workbench {
         else {
             return;
         };
+        self.restoring_state = true;
         self.load_project(root);
         // セッション構成を復元する（load_project が作ったシェルは作り直す）。
         let kinds: Vec<agents::AgentKind> = value
@@ -856,6 +893,8 @@ impl Workbench {
         if let Some(editor_open) = value.get("editor_open").and_then(|item| item.as_bool()) {
             self.editor_open = editor_open;
         }
+        self.restoring_state = false;
+        self.save_state();
         cx.notify();
     }
 
@@ -949,8 +988,14 @@ impl Workbench {
             }
             // 未保存のまま別ファイルへ行くときは、すぐ開かず確認バーを出す。
             if self.dirty {
+                self.editor_open = true;
+                self.diff_target = None;
+                self.diff_text = None;
+                self.pending_project = None;
+                self.pending_close = false;
                 self.pending_path = Some(path);
                 self.pending_position = None;
+                self.pending_navigation = None;
                 cx.notify();
                 return;
             }
@@ -970,42 +1015,38 @@ impl Workbench {
         jump: Option<Position>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        if self.editing_path.as_ref() == Some(&path) {
+            if let Some(position) = jump {
+                self.editor.update(cx, |state, cx| {
+                    state.set_cursor_position(position, window, cx)
+                });
+            }
+            self.editor_open = true;
+            self.file_error = None;
+            self.diff_target = None;
+            self.diff_text = None;
+            return true;
+        }
+        let text = match file_io::read_document(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.file_error = Some(format!("ファイルを開けなかった: {error}"));
+                self.status_message = self.file_error.clone();
+                cx.notify();
+                return false;
+            }
+        };
+        self.baseline = text.as_bytes().to_vec();
+        self.save_conflict = false;
         self.file_error = None;
         self.status_message = None;
         self.pending_path = None;
         self.pending_position = None;
+        self.pending_navigation = None;
         self.diff_target = None;
         self.diff_text = None;
-        // ファイルを開く操作ではエディタを表示する。
         self.editor_open = true;
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
-                self.file_error = Some("ファイルが大きいため開けない（上限 2 MB）。".into());
-                self.editing_path = None;
-                return;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                self.file_error = Some("ファイルを開けなかった。".into());
-                self.editing_path = None;
-                return;
-            }
-        }
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                self.file_error = Some("ファイルを読み込めなかった。".into());
-                self.editing_path = None;
-                return;
-            }
-        };
-        if bytes.iter().take(8192).any(|b| *b == 0) {
-            self.file_error = Some("バイナリファイルは開けない。".into());
-            self.editing_path = None;
-            return;
-        }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
         let language = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1042,6 +1083,7 @@ impl Workbench {
             focus_handle.focus(window, cx);
         }
         self.save_state();
+        true
     }
 
     /// 編集中のファイルを保存する。保存不要・保存成功なら true、失敗なら false。
@@ -1053,11 +1095,38 @@ impl Workbench {
             return true;
         }
         let text = self.editor.read(cx).text().to_string();
-        match std::fs::write(&path, text) {
+        match file_io::conflicts(&path, &self.baseline) {
+            Ok(true) if !self.save_conflict => {
+                self.save_conflict = true;
+                self.editor_open = true;
+                self.diff_target = None;
+                self.status_message =
+                    Some("外部変更と競合している。上書き・再読み込み・キャンセルを選ぶ".into());
+                cx.notify();
+                return false;
+            }
+            Err(error) => {
+                self.status_message = Some(format!("保存前の確認に失敗: {error}"));
+                cx.notify();
+                return false;
+            }
+            _ => {}
+        }
+        // Only the explicit overwrite button may bypass the conflict check.
+        if self.save_conflict {
+            return false;
+        }
+        self.write_current(&path, text, cx)
+    }
+
+    fn write_current(&mut self, path: &Path, text: String, cx: &mut Context<Self>) -> bool {
+        match file_io::atomic_save(path, text.as_bytes()) {
             Ok(()) => {
                 self.dirty = false;
+                self.baseline = text.into_bytes();
+                self.save_conflict = false;
                 self.disk_state =
-                    read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
+                    read_disk_state(path).map(|(mtime, hash)| (path.to_path_buf(), mtime, hash));
                 self.status_message = Some("保存した".into());
                 self.refresh_changes();
                 cx.notify();
@@ -1123,13 +1192,16 @@ impl Workbench {
         let Some(path) = self.editing_path.clone() else {
             return;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
+        let text = match file_io::read_document(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status_message = Some(format!("再読み込みできなかった: {error}"));
+                cx.notify();
+                return;
+            }
         };
-        if bytes.iter().take(8192).any(|b| *b == 0) {
-            return;
-        }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        self.baseline = text.as_bytes().to_vec();
+        self.save_conflict = false;
         let cursor = self.editor.read(cx).cursor_position();
         self.editor.update(cx, |state, cx| {
             state.set_value(text, window, cx);
@@ -1145,26 +1217,68 @@ impl Workbench {
 
     /// 確認バーで「保存して開く」が選ばれたとき。保存に成功したら待機中のファイルを開く。
     fn save_and_open_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_path.take() else {
-            return;
-        };
-        let position = self.pending_position.take();
         if self.save_current(cx) {
-            self.open_path_at(pending, position, window, cx);
-        } else {
-            self.pending_path = Some(pending);
-            self.pending_position = position;
+            self.continue_pending(window, cx);
         }
         cx.notify();
     }
 
-    /// 確認バーで「破棄して開く」が選ばれたとき。未保存の編集は捨てて開く。
     fn discard_and_open_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(pending) = self.pending_path.take() {
-            let position = self.pending_position.take();
-            self.open_path_at(pending, position, window, cx);
+        self.continue_pending(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_pending(&mut self) {
+        self.pending_path = None;
+        self.pending_position = None;
+        self.pending_navigation = None;
+        self.pending_project = None;
+        self.pending_close = false;
+        self.save_conflict = false;
+    }
+
+    fn continue_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close {
+            window.remove_window();
+            cx.quit();
+        } else if let Some(root) = self.pending_project.take() {
+            self.load_project(root);
+        } else if let Some(path) = self.pending_path.take() {
+            let position = self.pending_position.take().unwrap_or(Position::new(0, 0));
+            let operation = self.pending_navigation.take();
+            self.complete_navigation(path, position, operation, window, cx);
+        }
+    }
+
+    fn request_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.pending_project = Some(root);
+            self.pending_path = None;
+            self.pending_position = None;
+            self.pending_navigation = None;
+            self.pending_close = false;
+            self.editor_open = true;
+            self.diff_target = None;
+        } else {
+            self.load_project(root);
         }
         cx.notify();
+    }
+
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        self.pending_close = true;
+        self.pending_project = None;
+        self.pending_path = None;
+        self.pending_position = None;
+        self.pending_navigation = None;
+        self.editor_open = true;
+        self.diff_target = None;
+        self.terminal_focus.focus(window, cx);
+        cx.notify();
+        false
     }
 
     /// プロジェクト内を横断検索する（部分一致、大文字小文字を区別しない）。
@@ -1501,15 +1615,13 @@ impl Workbench {
         let Some(position) = self.location_position(location, cx) else {
             return;
         };
-        if origin.0 != location.path
-            || origin.1.line != position.line
-            || origin.1.character != position.character
-        {
-            self.nav_back.push(origin);
-            self.nav_forward.clear();
-        }
-        self.goto_candidates = None;
-        self.jump_to(location.path.clone(), position, window, cx);
+        self.request_navigation(
+            location.path.clone(),
+            position,
+            Some(PendingNavigation::Jump(origin.0, origin.1)),
+            window,
+            cx,
+        );
     }
 
     /// 履歴を積まずに (path, position) へ移動する。
@@ -1520,58 +1632,81 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editing_path.as_deref() == Some(path.as_path()) {
-            self.diff_target = None;
-            self.diff_text = None;
-            self.editor_open = true;
-            self.editor.update(cx, |state, cx| {
-                state.set_cursor_position(position, window, cx);
-            });
-        } else if self.dirty {
+        self.request_navigation(path, position, None, window, cx);
+    }
+
+    fn request_navigation(
+        &mut self,
+        path: PathBuf,
+        position: Position,
+        operation: Option<PendingNavigation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dirty && self.editing_path.as_ref() != Some(&path) {
+            self.pending_project = None;
+            self.pending_close = false;
             self.pending_path = Some(path);
             self.pending_position = Some(position);
+            self.pending_navigation = operation;
+            self.editor_open = true;
+            self.diff_target = None;
         } else {
-            self.open_path_at(path, Some(position), window, cx);
+            self.complete_navigation(path, position, operation, window, cx);
         }
         cx.notify();
     }
 
-    fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, position)) = self.nav_back.last().cloned() else {
-            return;
-        };
-        if self.dirty && self.editing_path.as_deref() != Some(path.as_path()) {
-            self.pending_path = Some(path);
-            self.pending_position = Some(position);
-            cx.notify();
+    /// 履歴は実際の移動が成功した後に一度だけ更新する。
+    fn complete_navigation(
+        &mut self,
+        path: PathBuf,
+        position: Position,
+        operation: Option<PendingNavigation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .editing_path
+            .clone()
+            .map(|path| (path, self.editor.read(cx).cursor_position()));
+        if !self.open_path_at(path.clone(), Some(position), window, cx) {
             return;
         }
-        self.nav_back.pop();
-        if let Some(current) = self.editing_path.clone() {
-            let cursor = self.editor.read(cx).cursor_position();
-            self.nav_forward.push((current, cursor));
+        match operation {
+            Some(PendingNavigation::Back) => {
+                self.nav_back.pop();
+                if let Some(current) = current {
+                    self.nav_forward.push(current);
+                }
+            }
+            Some(PendingNavigation::Forward) => {
+                self.nav_forward.pop();
+                if let Some(current) = current {
+                    self.nav_back.push(current);
+                }
+            }
+            Some(PendingNavigation::Jump(origin, cursor))
+                if origin != path || cursor != position =>
+            {
+                self.nav_back.push((origin, cursor));
+                self.nav_forward.clear();
+            }
+            _ => {}
         }
         self.goto_candidates = None;
-        self.jump_to(path, position, window, cx);
+    }
+
+    fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((path, position)) = self.nav_back.last().cloned() {
+            self.request_navigation(path, position, Some(PendingNavigation::Back), window, cx);
+        }
     }
 
     fn navigate_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, position)) = self.nav_forward.last().cloned() else {
-            return;
-        };
-        if self.dirty && self.editing_path.as_deref() != Some(path.as_path()) {
-            self.pending_path = Some(path);
-            self.pending_position = Some(position);
-            cx.notify();
-            return;
+        if let Some((path, position)) = self.nav_forward.last().cloned() {
+            self.request_navigation(path, position, Some(PendingNavigation::Forward), window, cx);
         }
-        self.nav_forward.pop();
-        if let Some(current) = self.editing_path.clone() {
-            let cursor = self.editor.read(cx).cursor_position();
-            self.nav_back.push((current, cursor));
-        }
-        self.goto_candidates = None;
-        self.jump_to(path, position, window, cx);
     }
 
     /// 検索結果をクリックしたとき：該当ファイルを開いて行へジャンプする。
@@ -1592,8 +1727,14 @@ impl Workbench {
             return;
         }
         if self.dirty {
+            self.editor_open = true;
+            self.diff_target = None;
+            self.diff_text = None;
+            self.pending_project = None;
+            self.pending_close = false;
             self.pending_path = Some(path);
             self.pending_position = Some(position);
+            self.pending_navigation = None;
             cx.notify();
             return;
         }
@@ -1613,7 +1754,7 @@ impl Workbench {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(root) = paths.into_iter().next() {
-                            this.load_project(root);
+                            this.request_project(root, cx);
                         }
                         this.picker_error = None;
                     }
@@ -1746,7 +1887,7 @@ impl Workbench {
                 row = row
                     .hover(|style| style.bg(rgb(SURFACE)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.load_project(path.clone());
+                        this.request_project(path.clone(), cx);
                         cx.notify();
                     }));
             }
@@ -2079,7 +2220,11 @@ impl Workbench {
         }
         let panel = div().v_flex().flex_1().min_w_0().h_full();
 
-        if let Some(error) = &self.file_error {
+        if let Some(error) = self
+            .file_error
+            .as_ref()
+            .filter(|_| self.editing_path.is_none())
+        {
             return panel.child(panel_header("エディタ", Glyph::File)).child(
                 div()
                     .flex_1()
@@ -2174,7 +2319,7 @@ impl Workbench {
             );
 
         let mut panel = panel.child(header);
-        if let Some(_pending) = &self.pending_path {
+        if self.pending_path.is_some() || self.pending_project.is_some() || self.pending_close {
             panel = panel.child(
                 div()
                     .h_flex()
@@ -2199,7 +2344,7 @@ impl Workbench {
                         Button::new("confirm-save-open")
                             .primary()
                             .small()
-                            .label("保存して開く")
+                            .label("保存して続行")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_and_open_pending(window, cx)
                             })),
@@ -2208,7 +2353,7 @@ impl Workbench {
                         Button::new("confirm-discard-open")
                             .ghost()
                             .small()
-                            .label("破棄して開く")
+                            .label("破棄して続行")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.discard_and_open_pending(window, cx)
                             })),
@@ -2219,11 +2364,48 @@ impl Workbench {
                             .small()
                             .label("キャンセル")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.pending_path = None;
+                                this.cancel_pending();
                                 cx.notify();
                             })),
                     ),
             );
+        }
+        if self.save_conflict {
+            panel =
+                panel.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .px_4()
+                        .py_2()
+                        .child("外部変更と競合")
+                        .child(Button::new("overwrite-conflict").label("上書き").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                let Some(path) = this.editing_path.clone() else {
+                                    return;
+                                };
+                                let text = this.editor.read(cx).text().to_string();
+                                if this.write_current(&path, text, cx) {
+                                    this.continue_pending(window, cx);
+                                }
+                            }),
+                        ))
+                        .child(Button::new("reload-conflict").label("再読み込み").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.reload_current_file(window, cx);
+                                if !this.dirty {
+                                    this.continue_pending(window, cx);
+                                }
+                            }),
+                        ))
+                        .child(Button::new("cancel-conflict").label("キャンセル").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.save_conflict = false;
+                                this.cancel_pending();
+                                cx.notify();
+                            }),
+                        )),
+                );
         }
         if let Some((candidates, _)) = &self.goto_candidates {
             let mut list = div()
@@ -2513,7 +2695,7 @@ impl Workbench {
                             column.map(|c| c.saturating_sub(1) as u32).unwrap_or(0),
                         )
                     });
-                    self.open_path_at(resolved, jump, window, cx);
+                    self.jump_to(resolved, jump.unwrap_or(Position::new(0, 0)), window, cx);
                 } else {
                     self.status_message = Some(format!("リンク先のファイルが見つからない: {path}"));
                     cx.notify();
@@ -3593,6 +3775,11 @@ impl Render for Workbench {
         div()
             .v_flex()
             .size_full()
+            .on_action(cx.listener(|this, _: &Quit, window, cx| {
+                if this.request_close(window, cx) {
+                    cx.quit();
+                }
+            }))
             .on_action(cx.listener(|this, _: &SaveFile, _, cx| this.save_file(cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleEditor, window, cx| this.toggle_editor(window, cx)),
@@ -3822,7 +4009,13 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.set_menus(vec![Menu {
+                name: "eren".into(),
+                disabled: false,
+                items: vec![MenuItem::action("終了", Quit)],
+            }]);
             cx.bind_keys([
+                KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-s", SaveFile, None),
                 KeyBinding::new("ctrl-s", SaveFile, None),
                 KeyBinding::new("cmd-e", ToggleEditor, None),
@@ -3851,6 +4044,14 @@ fn main() {
                 cx,
                 move |window, cx| {
                     cx.new(|cx| {
+                        let entity = cx.entity().downgrade();
+                        window.on_window_should_close(cx, move |window, cx| {
+                            entity
+                                .update(cx, |this: &mut Workbench, cx| {
+                                    this.request_close(window, cx)
+                                })
+                                .unwrap_or(true)
+                        });
                         let mut workbench = Workbench::new(window, cx);
                         if let Some(root) = initial_project {
                             workbench.load_project(root);
@@ -3960,5 +4161,382 @@ mod tests {
         for byte in (0..=s.len()).filter(|b| s.is_char_boundary(*b)) {
             assert_eq!(utf16_to_byte(s, byte_to_utf16(s, byte)), byte);
         }
+    }
+}
+
+#[cfg(test)]
+mod editor_safety_tests {
+    use super::Workbench;
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn history_commits_only_after_confirmed_success(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("eren-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let cursor = gpui_kit::component::input::Position::new(0, 0);
+        for outcome in ["save", "discard", "cancel", "failure"] {
+            std::fs::write(&a, "a").unwrap();
+            std::fs::write(&b, "b").unwrap();
+            let (handle, entity) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| Workbench::new(window, cx))
+                })
+                .unwrap()
+            });
+            cx.update_window(handle, |_, window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.open_path(a.clone(), window, cx);
+                    this.request_navigation(
+                        b.clone(),
+                        cursor,
+                        Some(super::PendingNavigation::Jump(a.clone(), cursor)),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                    assert!(this.nav_forward.is_empty());
+                    this.editor
+                        .update(cx, |editor, cx| editor.set_value("edited b", window, cx));
+                    this.dirty = true;
+                    this.navigate_back(window, cx);
+                    assert!(matches!(
+                        this.pending_navigation,
+                        Some(super::PendingNavigation::Back)
+                    ));
+                    assert_eq!(this.editing_path.as_ref(), Some(&b));
+                    assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                    assert!(this.nav_forward.is_empty());
+                    match outcome {
+                        "cancel" => {
+                            this.cancel_pending();
+                            assert!(this.pending_navigation.is_none());
+                            assert_eq!(this.editing_path.as_ref(), Some(&b));
+                            assert!(this.dirty);
+                            assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                            assert!(this.nav_forward.is_empty());
+                            return;
+                        }
+                        "failure" => {
+                            let permissions = std::fs::metadata(&b).unwrap().permissions();
+                            let mut readonly = permissions.clone();
+                            readonly.set_readonly(true);
+                            std::fs::set_permissions(&b, readonly).unwrap();
+                            this.save_and_open_pending(window, cx);
+                            assert_eq!(this.editing_path.as_ref(), Some(&b));
+                            assert!(this.dirty);
+                            assert!(matches!(
+                                this.pending_navigation,
+                                Some(super::PendingNavigation::Back)
+                            ));
+                            assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                            assert!(this.nav_forward.is_empty());
+                            std::fs::set_permissions(&b, permissions).unwrap();
+                            this.discard_and_open_pending(window, cx);
+                        }
+                        "save" => {
+                            this.save_and_open_pending(window, cx);
+                            assert_eq!(std::fs::read_to_string(&b).unwrap(), "edited b");
+                        }
+                        "discard" => this.discard_and_open_pending(window, cx),
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(this.editing_path.as_ref(), Some(&a));
+                    assert!(this.nav_back.is_empty());
+                    assert_eq!(this.nav_forward.len(), 1);
+                    assert_eq!(this.nav_forward[0].0, b);
+                    this.continue_pending(window, cx);
+                    assert!(this.nav_back.is_empty());
+                    assert_eq!(this.nav_forward.len(), 1);
+                    this.dirty = true;
+                    this.navigate_forward(window, cx);
+                    assert!(matches!(
+                        this.pending_navigation,
+                        Some(super::PendingNavigation::Forward)
+                    ));
+                    assert_eq!(this.nav_forward.len(), 1);
+                    assert!(this.nav_back.is_empty());
+                    this.discard_and_open_pending(window, cx);
+                    assert_eq!(this.editing_path.as_ref(), Some(&b));
+                    assert!(this.nav_forward.is_empty());
+                    assert_eq!(this.nav_back.len(), 1);
+                    assert_eq!(this.nav_back[0].0, a);
+                    // Failed reads also leave both histories intact, even after discard.
+                    this.nav_back.push((dir.join("missing"), cursor));
+                    let back = this.nav_back.clone();
+                    let forward = this.nav_forward.clone();
+                    this.dirty = true;
+                    this.navigate_back(window, cx);
+                    this.discard_and_open_pending(window, cx);
+                    assert_eq!(this.nav_back, back);
+                    assert_eq!(this.nav_forward, forward);
+                    assert_eq!(this.editing_path.as_ref(), Some(&b));
+                    assert!(this.dirty);
+                    // A new jump must not alter either history before confirmation.
+                    this.request_navigation(
+                        a.clone(),
+                        cursor,
+                        Some(super::PendingNavigation::Jump(b.clone(), cursor)),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(this.nav_back, back);
+                    assert_eq!(this.nav_forward, forward);
+                    this.cancel_pending();
+                    assert_eq!(this.nav_back, back);
+                    assert_eq!(this.nav_forward, forward);
+                })
+            })
+            .unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn layout_survives_repeated_restore_and_failed_save(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("eren-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "document").unwrap();
+        for editing_file in [None, Some(file.clone())] {
+            let expected = serde_json::json!({"project": dir, "sessions": ["shell", "shell"],
+                "active_session": 1, "editing_file": editing_file, "editor_open": false});
+            std::fs::write(&state_path, expected.to_string()).unwrap();
+            for _ in 0..2 {
+                let (handle, entity) = cx.update(|cx| {
+                    gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                        cx.new(|cx| Workbench::new(window, cx))
+                    })
+                    .unwrap()
+                });
+                cx.update_window(handle, |_, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.state_path = Some(state_path.clone());
+                        this.restore_state(window, cx);
+                        assert_eq!(this.sessions.len(), 2, "{:?}", this.session_error);
+                        assert_eq!(this.active_session, 1);
+                        assert_eq!(this.editing_path, editing_file);
+                        assert!(!this.editor_open);
+                        let saved: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+                        assert_eq!(saved, expected);
+                        // Intermediate persistence must not replace the complete state.
+                        this.restoring_state = true;
+                        this.active_session = 0;
+                        this.save_state();
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(
+                                &std::fs::read(&state_path).unwrap()
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                        this.restoring_state = false;
+                        this.active_session = 1;
+                        let permissions = std::fs::metadata(&state_path).unwrap().permissions();
+                        let mut readonly = permissions.clone();
+                        readonly.set_readonly(true);
+                        std::fs::set_permissions(&state_path, readonly).unwrap();
+                        this.active_session = 0;
+                        this.save_state();
+                        assert!(this
+                            .status_message
+                            .as_ref()
+                            .unwrap()
+                            .contains("状態を保存できなかった"));
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(
+                                &std::fs::read(&state_path).unwrap()
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                        std::fs::set_permissions(&state_path, permissions).unwrap();
+                        for tab in this.sessions.drain(..) {
+                            tab.session.shutdown();
+                        }
+                        window.remove_window();
+                    })
+                })
+                .unwrap();
+            }
+        }
+        std::fs::write(&state_path, "{invalid").unwrap();
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.state_path = Some(state_path.clone());
+                this.restore_state(window, cx);
+                assert!(this.project.is_none());
+                assert_eq!(std::fs::read_to_string(&state_path).unwrap(), "{invalid");
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pending_file_navigation_reveals_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("eren-pending-visible-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                for search in [false, true] {
+                    for diff in [false, true] {
+                        this.open_path(a.clone(), window, cx);
+                        this.editor
+                            .update(cx, |editor, cx| editor.set_value("unsaved", window, cx));
+                        this.dirty = true;
+                        this.editor_open = diff;
+                        this.diff_target = diff.then(|| "a.txt".into());
+                        this.diff_text = diff.then(|| "diff".into());
+                        if search {
+                            this.search_results = vec![super::SearchMatch {
+                                path: b.clone(),
+                                rel: "b.txt".into(),
+                                line: 0,
+                                col: 0,
+                                text: "b".into(),
+                            }];
+                            this.open_search_match(0, window, cx);
+                        } else {
+                            this.on_tree_click(b.clone(), false, window, cx);
+                        }
+                        assert_eq!(this.pending_path.as_ref(), Some(&b));
+                        assert!(
+                            this.editor_open,
+                            "search={search}, diff={diff}: 確認バーが非表示"
+                        );
+                        assert!(
+                            this.diff_target.is_none(),
+                            "search={search}, diff={diff}: diff が確認バーを隠す"
+                        );
+                        assert!(this.diff_text.is_none());
+                        assert_eq!(this.editing_path.as_ref(), Some(&a));
+                        assert!(this.dirty);
+                        assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                        this.cancel_pending();
+                        assert!(this.pending_path.is_none());
+                        assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                    }
+                }
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn failed_navigation_and_save_keep_the_document(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-editor-safety-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.txt");
+        std::fs::write(&path, "日本語😀\r\n").unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.open_path(path.clone(), window, cx);
+                assert_eq!(this.editor.read(cx).text().to_string(), "日本語😀\r\n");
+                this.editor
+                    .update(cx, |editor, cx| editor.set_value("unsaved", window, cx));
+                this.dirty = true;
+                this.open_path(dir.join("missing"), window, cx);
+                assert_eq!(this.editing_path.as_ref(), Some(&path));
+                assert!(this.dirty);
+                assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                this.request_project(dir.join("other"), cx);
+                assert_eq!(this.pending_project, Some(dir.join("other")));
+                assert!(this.project.is_none());
+                assert!(!this.request_close(window, cx));
+                assert!(this.pending_close);
+                assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                this.cancel_pending();
+                assert!(!this.pending_close);
+                assert!(this.pending_project.is_none());
+                assert!(this.dirty);
+                this.jump_to(
+                    path.clone(),
+                    gpui_kit::component::input::Position::new(0, 0),
+                    window,
+                    cx,
+                );
+                assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                this.pending_path = Some(dir.join("missing"));
+                let permissions = std::fs::metadata(&path).unwrap().permissions();
+                let mut readonly = permissions.clone();
+                readonly.set_readonly(true);
+                std::fs::set_permissions(&path, readonly).unwrap();
+                this.save_and_open_pending(window, cx);
+                assert!(this.dirty);
+                assert!(this.pending_path.is_some());
+                assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "日本語😀\r\n");
+                std::fs::set_permissions(&path, permissions).unwrap();
+                std::fs::write(&path, "external").unwrap();
+                this.save_and_open_pending(window, cx);
+                assert!(this.save_conflict);
+                assert!(this.dirty);
+                assert!(this.pending_path.is_some());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
+                assert!(!this.save_current(cx));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
+                this.discard_and_open_pending(window, cx);
+                assert!(this.dirty);
+                assert_eq!(this.editing_path.as_ref(), Some(&path));
+                assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                // Invalid external data must never replace the editable document.
+                std::fs::write(&path, [255]).unwrap();
+                this.reload_current_file(window, cx);
+                assert!(this.dirty);
+                assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                assert!(this.write_current(&path, "unsaved".into(), cx));
+                assert!(!this.dirty);
+                assert!(!this.save_conflict);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "unsaved");
+                this.dirty = true;
+                std::fs::remove_file(&path).unwrap();
+                assert!(!this.save_current(cx));
+                assert!(this.save_conflict);
+                assert!(this.dirty);
+                assert!(!path.exists());
+                this.cancel_pending();
+                assert!(this.dirty);
+                std::fs::write(&path, "reload 日本語😀\r\n").unwrap();
+                this.reload_current_file(window, cx);
+                assert!(!this.dirty);
+                assert_eq!(
+                    this.editor.read(cx).text().to_string(),
+                    "reload 日本語😀\r\n"
+                );
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
