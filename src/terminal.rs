@@ -226,6 +226,16 @@ impl TerminalSession {
     }
 
     fn spawn(cwd: &Path, cols: usize, rows: usize, command: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_in_env(cwd, cols, rows, command, HashMap::new())
+    }
+
+    fn spawn_in_env(
+        cwd: &Path,
+        cols: usize,
+        rows: usize,
+        command: Option<&str>,
+        env: HashMap<String, String>,
+    ) -> std::io::Result<Self> {
         // alacrittyは無効なcwdからホームへ退避するため、起動前に失敗を明示する。
         if !std::fs::metadata(cwd)?.is_dir() {
             return Err(std::io::Error::new(
@@ -259,7 +269,7 @@ impl TerminalSession {
             shell: Some(Shell::new(shell_path, args)),
             working_directory: Some(cwd.to_path_buf()),
             drain_on_exit: false,
-            env: HashMap::new(),
+            env,
         };
         let window_size = WindowSize {
             num_lines: rows as u16,
@@ -879,6 +889,55 @@ print('mode-fixture-ok', flush=True)
             outputs.iter().all(|text| text.contains("mode-fixture-ok")),
             "{outputs:?}"
         );
+    }
+
+    #[test]
+    fn interactive_shell_preserves_nonzero_exit_codes() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "eren-shell-config-{}-{}",
+            std::process::id(),
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&config_dir).unwrap();
+        let env = HashMap::from([
+            ("ZDOTDIR".into(), config_dir.to_string_lossy().into_owned()),
+            ("HOME".into(), config_dir.to_string_lossy().into_owned()),
+        ]);
+        for input in [b"exit 7\r".as_slice(), b"exec /bin/sh -c 'exit 7'\r"] {
+            let session =
+                TerminalSession::spawn_in_env(&std::env::temp_dir(), 80, 24, None, env.clone())
+                    .unwrap();
+            // ログイン設定の完了を固定時間で仮定しない。
+            let ready = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !session.visible_text().contains("shell-probe-ready")
+                && std::time::Instant::now() < ready
+            {
+                session.write(b"printf '%s%s\\n' shell-probe- ready\r");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                session.process_events();
+            }
+            assert!(
+                session.visible_text().contains("shell-probe-ready"),
+                "{:?}",
+                session.visible_text()
+            );
+            session.write(input);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                session.process_events();
+                if session.worker.lock().unwrap().is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                session.state(),
+                SessionState::Exited(Some(7)),
+                "input: {input:?}, output: {:?}",
+                session.visible_text()
+            );
+        }
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]
