@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// ジャンプ先（LSP の Location / LocationLink を正規化したもの）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +23,19 @@ pub struct LspLocation {
     pub character: u32,
 }
 
-type PendingMap = HashMap<i64, mpsc::Sender<Result<Value, String>>>;
+#[derive(Default)]
+struct PendingState {
+    requests: HashMap<i64, mpsc::Sender<Result<Value, String>>>,
+    disconnected: bool,
+}
+
+fn disconnect(pending: &Mutex<PendingState>, error: &str) {
+    let mut pending = pending.lock().unwrap();
+    pending.disconnected = true;
+    for (_, sender) in pending.requests.drain() {
+        let _ = sender.send(Err(error.to_string()));
+    }
+}
 
 /// 進行中の作業（workDoneProgress）1件。
 #[derive(Clone, Debug)]
@@ -42,9 +54,10 @@ struct DocumentSync {
 /// stdio LSP クライアント。
 #[allow(dead_code)]
 pub struct LspClient {
-    _child: Mutex<Child>,
+    child: Mutex<Option<Child>>,
     writer: Arc<Mutex<ChildStdin>>,
-    pending: Arc<Mutex<PendingMap>>,
+    pending: Arc<Mutex<PendingState>>,
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     diagnostics_version: Arc<AtomicU64>,
     progress: Arc<Mutex<HashMap<String, ProgressEntry>>>,
@@ -96,6 +109,15 @@ fn read_message(reader: &mut BufReader<impl Read>) -> Option<Value> {
 impl LspClient {
     /// サーバーを起動し、initialize ハンドシェイクまで終える。
     pub fn spawn(program: &str, args: &[&str], root: &Path) -> Result<LspClient, String> {
+        Self::spawn_cancellable(program, args, root, || false)
+    }
+
+    pub fn spawn_cancellable(
+        program: &str,
+        args: &[&str],
+        root: &Path,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<LspClient, String> {
         let mut child = Command::new(program)
             .args(args)
             .current_dir(root)
@@ -107,7 +129,7 @@ impl LspClient {
         let stdin = child.stdin.take().ok_or("stdin を取得できなかった")?;
         let stdout = child.stdout.take().ok_or("stdout を取得できなかった")?;
         let writer = Arc::new(Mutex::new(stdin));
-        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(PendingState::default()));
         let diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics_version = Arc::new(AtomicU64::new(0));
@@ -115,7 +137,7 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let progress_version = Arc::new(AtomicU64::new(0));
 
-        {
+        let reader = {
             let writer = Arc::clone(&writer);
             let pending = Arc::clone(&pending);
             let diagnostics = Arc::clone(&diagnostics);
@@ -139,7 +161,8 @@ impl LspClient {
                                 Ok(message.get("result").cloned().unwrap_or(Value::Null))
                             };
                             if let Some(key) = id.as_i64() {
-                                if let Some(sender) = pending.lock().unwrap().remove(&key) {
+                                if let Some(sender) = pending.lock().unwrap().requests.remove(&key)
+                                {
                                     let _ = sender.send(result);
                                 }
                             }
@@ -155,10 +178,14 @@ impl LspClient {
                             } else {
                                 Value::Null
                             };
-                            let _ = write_message(
+                            if write_message(
                                 &writer,
                                 &json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                            );
+                            )
+                            .is_err()
+                            {
+                                break;
+                            }
                         }
                         (None, Some(method)) => {
                             // 通知。診断と進捗だけ保持する。
@@ -237,13 +264,15 @@ impl LspClient {
                         (None, None) => {}
                     }
                 }
-            });
-        }
+                disconnect(&pending, "言語サーバーとの接続が切れた");
+            })
+        };
 
         let mut client = LspClient {
-            _child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
             writer,
             pending,
+            reader: Mutex::new(Some(reader)),
             diagnostics,
             diagnostics_version,
             progress,
@@ -255,7 +284,7 @@ impl LspClient {
         };
 
         let root_uri = path_to_uri(root);
-        let result = client.request(
+        let result = client.request_cancellable(
             "initialize",
             json!({
                 "processId": Value::Null,
@@ -274,6 +303,8 @@ impl LspClient {
                     "window": {"workDoneProgress": true}
                 }
             }),
+            Duration::from_secs(60),
+            &cancelled,
         )?;
         client.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
         client.notify("initialized", json!({}))?;
@@ -281,6 +312,10 @@ impl LspClient {
     }
 
     /// サーバーが capabilities で宣言しているかどうかをざっくり判定する。
+    pub fn is_connected(&self) -> bool {
+        !self.pending.lock().unwrap().disconnected
+    }
+
     pub fn supports(&self, capability_key: &str) -> bool {
         match self.capabilities.get(capability_key) {
             None | Some(Value::Null) => false,
@@ -290,27 +325,88 @@ impl LspClient {
     }
 
     pub fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_cancellable(method, params, Duration::from_secs(60), &|| false)
+    }
+
+    fn request_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, sender);
-        write_message(
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.disconnected {
+                return Err("言語サーバーとの接続が切れた".into());
+            }
+            pending.requests.insert(id, sender);
+        }
+        if let Err(error) = write_message(
             &self.writer,
             &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
-        )?;
-        match receiver.recv_timeout(Duration::from_secs(60)) {
-            Ok(result) => result,
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err("言語サーバーが応答しなかった".into())
-            }
+        ) {
+            disconnect(&self.pending, &error);
+            return Err(error);
         }
+        let deadline = Instant::now() + timeout;
+        let error = loop {
+            if cancelled() {
+                break "言語サーバーの要求を取り消した";
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break "言語サーバーが応答しなかった";
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break "言語サーバーとの接続が切れた";
+                }
+            }
+        };
+        self.pending.lock().unwrap().requests.remove(&id);
+        Err(error.into())
     }
 
     pub fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        write_message(
+        if self.pending.lock().unwrap().disconnected {
+            return Err("言語サーバーとの接続が切れた".into());
+        }
+        let result = write_message(
             &self.writer,
             &json!({"jsonrpc": "2.0", "method": method, "params": params}),
-        )
+        );
+        if let Err(error) = &result {
+            disconnect(&self.pending, error);
+        }
+        result
+    }
+
+    /// Arc を保持する旧要求が残っていても、プロジェクト切り替え時に終了できる。
+    pub fn shutdown(&self) -> Option<std::thread::JoinHandle<()>> {
+        disconnect(&self.pending, "言語サーバーを終了した");
+        let child = self.child.lock().unwrap().take();
+        let reader = self.reader.lock().unwrap().take();
+        if child.is_none() && reader.is_none() {
+            return None;
+        }
+        // kill は待機せず、wait と reader の join は UI スレッドの外へ渡す。
+        let child = child.map(|mut child| {
+            let _ = child.kill();
+            child
+        });
+        Some(std::thread::spawn(move || {
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+            if let Some(reader) = reader {
+                let _ = reader.join();
+            }
+        }))
     }
 
     /// 現在の一文書を同期する。再訪時は close/open、同じ内容の再送は省く。
@@ -482,6 +578,12 @@ impl LspClient {
     }
 }
 
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Location / LocationLink / その配列 / null を正規化する。
 fn parse_locations(result: &Value) -> Vec<LspLocation> {
     fn one(value: &Value) -> Option<LspLocation> {
@@ -621,9 +723,135 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn stop_mock(client: &LspClient) {
-        let mut child = client._child.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(reaper) = client.shutdown() {
+            reaper.join().unwrap();
+        }
+    }
+
+    fn wait_pending(client: &LspClient, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while client.pending.lock().unwrap().requests.len() != count {
+            assert!(Instant::now() < deadline, "要求数が変わらない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_process_reaped(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive = Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "子プロセス {pid} が残っている");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn eof_fails_all_pending_and_future_requests_immediately() {
+        let client = mock_client("0");
+        let waiting_client = client.clone();
+        let waiting =
+            std::thread::spawn(move || waiting_client.request("test/no-response", json!({})));
+        wait_pending(&client, 1);
+        let started = Instant::now();
+        assert!(client.request("test/exit", json!({})).is_err());
+        assert!(waiting.join().unwrap().is_err());
+        assert!(client.request("test/after-exit", json!({})).is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(client.pending.lock().unwrap().requests.is_empty());
+        stop_mock(&client);
+    }
+
+    #[test]
+    fn broken_pipe_drains_pending_without_waiting_for_stdout_eof() {
+        let client = mock_client("0");
+        client.request("test/close-input", json!({})).unwrap();
+        assert!(!client.pending.lock().unwrap().disconnected);
+        let started = Instant::now();
+        assert!(client.request("test/write-failure", json!({})).is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(client.pending.lock().unwrap().requests.is_empty());
+        assert!(client.pending.lock().unwrap().disconnected);
+        stop_mock(&client);
+    }
+
+    #[test]
+    fn timeout_discards_late_response_and_keeps_connection_usable() {
+        let client = mock_client("0");
+        assert!(client
+            .request_cancellable(
+                "textDocument/definition",
+                json!({"position": {"character": 0}}),
+                Duration::from_millis(20),
+                &|| false
+            )
+            .is_err());
+        assert!(client.pending.lock().unwrap().requests.is_empty());
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(client.request("test/notifications", json!({})).is_ok());
+        assert!(client.pending.lock().unwrap().requests.is_empty());
+        stop_mock(&client);
+    }
+
+    #[test]
+    fn shutdown_reaps_process_and_reader_even_with_pending_arc() {
+        let client = mock_client("0");
+        let pid = client.child.lock().unwrap().as_ref().unwrap().id();
+        let waiting_client = client.clone();
+        let waiting =
+            std::thread::spawn(move || waiting_client.request("test/no-response", json!({})));
+        wait_pending(&client, 1);
+        let started = Instant::now();
+        let reaper = client.shutdown().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(waiting.join().unwrap().is_err());
+        reaper.join().unwrap();
+        assert!(client.reader.lock().unwrap().is_none());
+        assert!(client.pending.lock().unwrap().requests.is_empty());
+        assert!(client.shutdown().is_none());
+        assert_process_reaped(pid);
+    }
+
+    #[test]
+    fn drop_and_cancelled_initialization_release_child_processes() {
+        let client = mock_client("0");
+        let pid = client.child.lock().unwrap().as_ref().unwrap().id();
+        drop(client);
+        assert_process_reaped(pid);
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/delayed_lsp.py");
+        for mode in ["cancel", "initialize-error"] {
+            let pid_path =
+                std::env::temp_dir().join(format!("eren-lsp-{}-{mode}.pid", std::process::id()));
+            let _ = std::fs::remove_file(&pid_path);
+            let started = Instant::now();
+            let result = LspClient::spawn_cancellable(
+                "python3",
+                &[
+                    "-u",
+                    fixture,
+                    if mode == "cancel" { "60" } else { "0" },
+                    pid_path.to_str().unwrap(),
+                    mode,
+                ],
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                || {
+                    mode == "cancel"
+                        && (pid_path.exists() || started.elapsed() > Duration::from_secs(3))
+                },
+            );
+            assert!(result.is_err());
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let pid: u32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+            assert_process_reaped(pid);
+            std::fs::remove_file(pid_path).unwrap();
+        }
     }
 
     #[test]

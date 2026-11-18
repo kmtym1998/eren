@@ -273,6 +273,16 @@ pub struct Workbench {
     last_diag_version: u64,
 }
 
+impl Drop for Workbench {
+    fn drop(&mut self) {
+        self.lsp_epoch.lock().unwrap().next_project();
+        if let Some(client) = self.lsp.lock().unwrap().take() {
+            let _ = client.close_document();
+            client.shutdown();
+        }
+    }
+}
+
 /// 定義・実装ジャンプの候補1件。
 pub struct GotoCandidate {
     path: PathBuf,
@@ -726,6 +736,7 @@ impl Workbench {
             let project = epoch.next_project();
             if let Some(client) = self.lsp.lock().unwrap().take() {
                 let _ = client.close_document();
+                client.shutdown();
             }
             *self.lsp_error.lock().unwrap() = None;
             project
@@ -787,7 +798,12 @@ impl Workbench {
             let epoch = self.lsp_epoch.clone();
             std::thread::spawn(move || {
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let result = lsp::LspClient::spawn(&program, &arg_refs, &root_for_thread);
+                let result = lsp::LspClient::spawn_cancellable(
+                    &program,
+                    &arg_refs,
+                    &root_for_thread,
+                    || !epoch.lock().unwrap().is_project(project_generation),
+                );
                 let epoch = epoch.lock().unwrap();
                 if !epoch.is_project(project_generation) {
                     return;
@@ -1388,6 +1404,9 @@ impl Workbench {
         }
         let client = self.lsp.lock().unwrap().clone();
         let Some(client) = client else { return };
+        if !client.is_connected() {
+            return;
+        }
         let document = self
             .editing_path
             .as_deref()
