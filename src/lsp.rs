@@ -486,7 +486,7 @@ impl LspClient {
         path: &Path,
         text: &str,
         byte_offset: usize,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<lsp_types::Hover>, String> {
         let (line, character) = offset_to_position(text, byte_offset);
         let result = self.request(
             "textDocument/hover",
@@ -495,28 +495,7 @@ impl LspClient {
                 "position": {"line": line, "character": character}
             }),
         )?;
-        if result.is_null() {
-            return Ok(None);
-        }
-        let contents = &result["contents"];
-        let text = if let Some(value) = contents.get("value").and_then(Value::as_str) {
-            value.to_string()
-        } else if let Some(array) = contents.as_array() {
-            array
-                .iter()
-                .filter_map(|item| {
-                    item.as_str().map(str::to_string).or_else(|| {
-                        item.get("value")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            return Ok(None);
-        };
-        Ok(Some(text))
+        serde_json::from_value(result).map_err(|error| format!("hover の応答が不正: {error}"))
     }
 
     /// 参照検索（textDocument/references、宣言も含む）。
@@ -855,6 +834,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mock_hover_preserves_all_lsp_forms_and_renders_literal_plaintext() {
+        use lsp_types::{HoverContents, MarkupKind};
+        let client = mock_client("0");
+        let expected = [
+            "valid plaintext hover",
+            "```rust\nfn helper() {}\n```",
+            "```\n**literal** <b> &\n```",
+            "**bold**",
+            "docs\n\n```rust\nfn f() {}\n```",
+        ];
+        for (offset, expected) in expected.into_iter().enumerate() {
+            let hover = client
+                .hover(Path::new("/tmp/a.rs"), "abcdef", offset)
+                .unwrap()
+                .unwrap();
+            if offset == 2 {
+                assert!(
+                    matches!(&hover.contents, HoverContents::Markup(value) if value.kind == MarkupKind::PlainText)
+                );
+            }
+            let rendered = crate::lsp_hover::for_markdown(hover);
+            let HoverContents::Markup(markup) = rendered.contents else {
+                panic!("markup")
+            };
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert_eq!(markup.value, expected);
+            assert_eq!(rendered.range.is_some(), offset == 3);
+        }
+        assert!(client
+            .hover(Path::new("/tmp/a.rs"), "abcdef", 5)
+            .unwrap()
+            .is_none());
+        stop_mock(&client);
+    }
+
+    #[test]
     fn document_notifications_are_balanced_and_versions_survive_reopen() {
         // 起動前に復元・編集された文書は、準備後に最新の本文を一度だけ送る。
         let client = mock_client("0.1");
@@ -1031,5 +1046,14 @@ pub(crate) mod tests {
         assert_eq!(locations.len(), 1, "定義が1件返るはず: {locations:?}");
         assert_eq!(locations[0].line, 0, "helper の定義は0行目");
         assert!(locations[0].path.ends_with("src/main.rs"));
+        let hover = client
+            .hover(&main_rs, source, call_offset)
+            .unwrap()
+            .expect("hover");
+        let rendered = crate::lsp_hover::for_markdown(hover);
+        let lsp_types::HoverContents::Markup(markup) = rendered.contents else {
+            panic!("markup")
+        };
+        assert!(markup.value.contains("helper"), "hover: {}", markup.value);
     }
 }

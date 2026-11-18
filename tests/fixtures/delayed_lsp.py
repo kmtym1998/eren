@@ -17,7 +17,19 @@ def respond(message):
     method = message.get("method")
     if method == "initialize":
         time.sleep(float(sys.argv[1]))
-        result = {"capabilities": {"definitionProvider": True}}
+        result = {"capabilities": {"definitionProvider": True, "hoverProvider": True}}
+    elif method == "textDocument/hover":
+        character = message["params"]["position"]["character"]
+        cases = [
+            {"contents": "valid plaintext hover"},
+            {"contents": {"language": "rust", "value": "fn helper() {}"}},
+            {"contents": {"kind": "plaintext", "value": "**literal** <b> &"}},
+            {"contents": {"kind": "markdown", "value": "**bold**"}, "range": {
+                "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}},
+            {"contents": ["docs", {"language": "rust", "value": "fn f() {}"}]},
+            None,
+        ]
+        result = cases[character]
     elif method == "test/notifications":
         result = list(notifications)
     else:

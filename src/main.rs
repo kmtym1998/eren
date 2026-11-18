@@ -16,6 +16,7 @@ mod file_io;
 mod links;
 mod lsp;
 mod lsp_epoch;
+mod lsp_hover;
 use lsp_epoch::{LspEpoch, RequestKind};
 mod symbols;
 mod terminal;
@@ -322,17 +323,9 @@ impl HoverProvider for LspHoverProvider {
             if !epoch.lock().unwrap().accepts(RequestKind::Hover, token) {
                 return Ok(None);
             }
-            match result {
-                Ok(Some(value)) => Ok(Some(lsp_types::Hover {
-                    contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
-                        kind: lsp_types::MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                })),
-                Ok(None) => Ok(None),
-                Err(error) => Err(anyhow::anyhow!(error)),
-            }
+            result
+                .map(|hover| hover.map(lsp_hover::for_markdown))
+                .map_err(anyhow::Error::msg)
         })
     }
 }
