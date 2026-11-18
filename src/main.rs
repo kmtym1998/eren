@@ -182,6 +182,13 @@ fn git_branch(root: &Path) -> Option<String> {
         .map(|name| name.to_string())
 }
 
+#[derive(Clone)]
+enum PendingNavigation {
+    Jump(PathBuf, Position),
+    Back,
+    Forward,
+}
+
 pub struct Workbench {
     project: Option<PathBuf>,
     picker_error: Option<String>,
@@ -233,6 +240,7 @@ pub struct Workbench {
     _search_subscription: Subscription,
     /// 検索結果から開くときのジャンプ先（未保存確認を挟む場合に保持する）。
     pending_position: Option<Position>,
+    pending_navigation: Option<PendingNavigation>,
     /// 言語サーバー（rust-analyzer）のクライアント。起動はバックグラウンドで行い、
     /// 準備ができたらここに入る。
     lsp: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<lsp::LspClient>>>>,
@@ -677,6 +685,7 @@ impl Workbench {
             search_truncated: false,
             _search_subscription: search_subscription,
             pending_position: None,
+            pending_navigation: None,
             lsp: lsp_slot,
             lsp_error: lsp_error_slot,
             lsp_server: None,
@@ -716,6 +725,7 @@ impl Workbench {
         self.search_results = Vec::new();
         self.search_truncated = false;
         self.pending_position = None;
+        self.pending_navigation = None;
         self.disk_state = None;
         self.lsp_open_docs.clear();
         *self.hover_doc.lock().unwrap() = None;
@@ -985,6 +995,7 @@ impl Workbench {
                 self.pending_close = false;
                 self.pending_path = Some(path);
                 self.pending_position = None;
+                self.pending_navigation = None;
                 cx.notify();
                 return;
             }
@@ -1004,7 +1015,7 @@ impl Workbench {
         jump: Option<Position>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.editing_path.as_ref() == Some(&path) {
             if let Some(position) = jump {
                 self.editor.update(cx, |state, cx| {
@@ -1015,7 +1026,7 @@ impl Workbench {
             self.file_error = None;
             self.diff_target = None;
             self.diff_text = None;
-            return;
+            return true;
         }
         let text = match file_io::read_document(&path) {
             Ok(text) => text,
@@ -1023,7 +1034,7 @@ impl Workbench {
                 self.file_error = Some(format!("ファイルを開けなかった: {error}"));
                 self.status_message = self.file_error.clone();
                 cx.notify();
-                return;
+                return false;
             }
         };
         self.baseline = text.as_bytes().to_vec();
@@ -1032,6 +1043,7 @@ impl Workbench {
         self.status_message = None;
         self.pending_path = None;
         self.pending_position = None;
+        self.pending_navigation = None;
         self.diff_target = None;
         self.diff_text = None;
         self.editor_open = true;
@@ -1071,6 +1083,7 @@ impl Workbench {
             focus_handle.focus(window, cx);
         }
         self.save_state();
+        true
     }
 
     /// 編集中のファイルを保存する。保存不要・保存成功なら true、失敗なら false。
@@ -1218,6 +1231,7 @@ impl Workbench {
     fn cancel_pending(&mut self) {
         self.pending_path = None;
         self.pending_position = None;
+        self.pending_navigation = None;
         self.pending_project = None;
         self.pending_close = false;
         self.save_conflict = false;
@@ -1230,8 +1244,9 @@ impl Workbench {
         } else if let Some(root) = self.pending_project.take() {
             self.load_project(root);
         } else if let Some(path) = self.pending_path.take() {
-            let position = self.pending_position.take();
-            self.open_path_at(path, position, window, cx);
+            let position = self.pending_position.take().unwrap_or(Position::new(0, 0));
+            let operation = self.pending_navigation.take();
+            self.complete_navigation(path, position, operation, window, cx);
         }
     }
 
@@ -1240,6 +1255,7 @@ impl Workbench {
             self.pending_project = Some(root);
             self.pending_path = None;
             self.pending_position = None;
+            self.pending_navigation = None;
             self.pending_close = false;
             self.editor_open = true;
             self.diff_target = None;
@@ -1257,6 +1273,7 @@ impl Workbench {
         self.pending_project = None;
         self.pending_path = None;
         self.pending_position = None;
+        self.pending_navigation = None;
         self.editor_open = true;
         self.diff_target = None;
         self.terminal_focus.focus(window, cx);
@@ -1598,15 +1615,13 @@ impl Workbench {
         let Some(position) = self.location_position(location, cx) else {
             return;
         };
-        if origin.0 != location.path
-            || origin.1.line != position.line
-            || origin.1.character != position.character
-        {
-            self.nav_back.push(origin);
-            self.nav_forward.clear();
-        }
-        self.goto_candidates = None;
-        self.jump_to(location.path.clone(), position, window, cx);
+        self.request_navigation(
+            location.path.clone(),
+            position,
+            Some(PendingNavigation::Jump(origin.0, origin.1)),
+            window,
+            cx,
+        );
     }
 
     /// 履歴を積まずに (path, position) へ移動する。
@@ -1617,64 +1632,81 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editing_path.as_deref() == Some(path.as_path()) {
-            self.diff_target = None;
-            self.diff_text = None;
-            self.editor_open = true;
-            self.editor.update(cx, |state, cx| {
-                state.set_cursor_position(position, window, cx);
-            });
-        } else if self.dirty {
+        self.request_navigation(path, position, None, window, cx);
+    }
+
+    fn request_navigation(
+        &mut self,
+        path: PathBuf,
+        position: Position,
+        operation: Option<PendingNavigation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dirty && self.editing_path.as_ref() != Some(&path) {
             self.pending_project = None;
             self.pending_close = false;
             self.pending_path = Some(path);
             self.pending_position = Some(position);
+            self.pending_navigation = operation;
+            self.editor_open = true;
+            self.diff_target = None;
         } else {
-            self.open_path_at(path, Some(position), window, cx);
+            self.complete_navigation(path, position, operation, window, cx);
         }
         cx.notify();
     }
 
-    fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, position)) = self.nav_back.last().cloned() else {
-            return;
-        };
-        if self.dirty && self.editing_path.as_deref() != Some(path.as_path()) {
-            self.pending_project = None;
-            self.pending_close = false;
-            self.pending_path = Some(path);
-            self.pending_position = Some(position);
-            cx.notify();
+    /// 履歴は実際の移動が成功した後に一度だけ更新する。
+    fn complete_navigation(
+        &mut self,
+        path: PathBuf,
+        position: Position,
+        operation: Option<PendingNavigation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .editing_path
+            .clone()
+            .map(|path| (path, self.editor.read(cx).cursor_position()));
+        if !self.open_path_at(path.clone(), Some(position), window, cx) {
             return;
         }
-        self.nav_back.pop();
-        if let Some(current) = self.editing_path.clone() {
-            let cursor = self.editor.read(cx).cursor_position();
-            self.nav_forward.push((current, cursor));
+        match operation {
+            Some(PendingNavigation::Back) => {
+                self.nav_back.pop();
+                if let Some(current) = current {
+                    self.nav_forward.push(current);
+                }
+            }
+            Some(PendingNavigation::Forward) => {
+                self.nav_forward.pop();
+                if let Some(current) = current {
+                    self.nav_back.push(current);
+                }
+            }
+            Some(PendingNavigation::Jump(origin, cursor))
+                if origin != path || cursor != position =>
+            {
+                self.nav_back.push((origin, cursor));
+                self.nav_forward.clear();
+            }
+            _ => {}
         }
         self.goto_candidates = None;
-        self.jump_to(path, position, window, cx);
+    }
+
+    fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((path, position)) = self.nav_back.last().cloned() {
+            self.request_navigation(path, position, Some(PendingNavigation::Back), window, cx);
+        }
     }
 
     fn navigate_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, position)) = self.nav_forward.last().cloned() else {
-            return;
-        };
-        if self.dirty && self.editing_path.as_deref() != Some(path.as_path()) {
-            self.pending_project = None;
-            self.pending_close = false;
-            self.pending_path = Some(path);
-            self.pending_position = Some(position);
-            cx.notify();
-            return;
+        if let Some((path, position)) = self.nav_forward.last().cloned() {
+            self.request_navigation(path, position, Some(PendingNavigation::Forward), window, cx);
         }
-        self.nav_forward.pop();
-        if let Some(current) = self.editing_path.clone() {
-            let cursor = self.editor.read(cx).cursor_position();
-            self.nav_back.push((current, cursor));
-        }
-        self.goto_candidates = None;
-        self.jump_to(path, position, window, cx);
     }
 
     /// 検索結果をクリックしたとき：該当ファイルを開いて行へジャンプする。
@@ -1702,6 +1734,7 @@ impl Workbench {
             self.pending_close = false;
             self.pending_path = Some(path);
             self.pending_position = Some(position);
+            self.pending_navigation = None;
             cx.notify();
             return;
         }
@@ -4051,6 +4084,131 @@ mod tests {
 mod editor_safety_tests {
     use super::Workbench;
     use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn history_commits_only_after_confirmed_success(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("eren-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let cursor = gpui_kit::component::input::Position::new(0, 0);
+        for outcome in ["save", "discard", "cancel", "failure"] {
+            std::fs::write(&a, "a").unwrap();
+            std::fs::write(&b, "b").unwrap();
+            let (handle, entity) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| Workbench::new(window, cx))
+                })
+                .unwrap()
+            });
+            cx.update_window(handle, |_, window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.open_path(a.clone(), window, cx);
+                    this.request_navigation(
+                        b.clone(),
+                        cursor,
+                        Some(super::PendingNavigation::Jump(a.clone(), cursor)),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                    assert!(this.nav_forward.is_empty());
+                    this.editor
+                        .update(cx, |editor, cx| editor.set_value("edited b", window, cx));
+                    this.dirty = true;
+                    this.navigate_back(window, cx);
+                    assert!(matches!(
+                        this.pending_navigation,
+                        Some(super::PendingNavigation::Back)
+                    ));
+                    assert_eq!(this.editing_path.as_ref(), Some(&b));
+                    assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                    assert!(this.nav_forward.is_empty());
+                    match outcome {
+                        "cancel" => {
+                            this.cancel_pending();
+                            assert!(this.pending_navigation.is_none());
+                            assert_eq!(this.editing_path.as_ref(), Some(&b));
+                            assert!(this.dirty);
+                            assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                            assert!(this.nav_forward.is_empty());
+                            return;
+                        }
+                        "failure" => {
+                            let permissions = std::fs::metadata(&b).unwrap().permissions();
+                            let mut readonly = permissions.clone();
+                            readonly.set_readonly(true);
+                            std::fs::set_permissions(&b, readonly).unwrap();
+                            this.save_and_open_pending(window, cx);
+                            assert_eq!(this.editing_path.as_ref(), Some(&b));
+                            assert!(this.dirty);
+                            assert!(matches!(
+                                this.pending_navigation,
+                                Some(super::PendingNavigation::Back)
+                            ));
+                            assert_eq!(this.nav_back, vec![(a.clone(), cursor)]);
+                            assert!(this.nav_forward.is_empty());
+                            std::fs::set_permissions(&b, permissions).unwrap();
+                            this.discard_and_open_pending(window, cx);
+                        }
+                        "save" => {
+                            this.save_and_open_pending(window, cx);
+                            assert_eq!(std::fs::read_to_string(&b).unwrap(), "edited b");
+                        }
+                        "discard" => this.discard_and_open_pending(window, cx),
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(this.editing_path.as_ref(), Some(&a));
+                    assert!(this.nav_back.is_empty());
+                    assert_eq!(this.nav_forward.len(), 1);
+                    assert_eq!(this.nav_forward[0].0, b);
+                    this.continue_pending(window, cx);
+                    assert!(this.nav_back.is_empty());
+                    assert_eq!(this.nav_forward.len(), 1);
+                    this.dirty = true;
+                    this.navigate_forward(window, cx);
+                    assert!(matches!(
+                        this.pending_navigation,
+                        Some(super::PendingNavigation::Forward)
+                    ));
+                    assert_eq!(this.nav_forward.len(), 1);
+                    assert!(this.nav_back.is_empty());
+                    this.discard_and_open_pending(window, cx);
+                    assert_eq!(this.editing_path.as_ref(), Some(&b));
+                    assert!(this.nav_forward.is_empty());
+                    assert_eq!(this.nav_back.len(), 1);
+                    assert_eq!(this.nav_back[0].0, a);
+                    // Failed reads also leave both histories intact, even after discard.
+                    this.nav_back.push((dir.join("missing"), cursor));
+                    let back = this.nav_back.clone();
+                    let forward = this.nav_forward.clone();
+                    this.dirty = true;
+                    this.navigate_back(window, cx);
+                    this.discard_and_open_pending(window, cx);
+                    assert_eq!(this.nav_back, back);
+                    assert_eq!(this.nav_forward, forward);
+                    assert_eq!(this.editing_path.as_ref(), Some(&b));
+                    assert!(this.dirty);
+                    // A new jump must not alter either history before confirmation.
+                    this.request_navigation(
+                        a.clone(),
+                        cursor,
+                        Some(super::PendingNavigation::Jump(b.clone(), cursor)),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(this.nav_back, back);
+                    assert_eq!(this.nav_forward, forward);
+                    this.cancel_pending();
+                    assert_eq!(this.nav_back, back);
+                    assert_eq!(this.nav_forward, forward);
+                })
+            })
+            .unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[gpui_kit::test]
     fn layout_survives_repeated_restore_and_failed_save(cx: &mut TestAppContext) {
