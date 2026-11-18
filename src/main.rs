@@ -3670,7 +3670,7 @@ fn split_cell(line: Option<&diff::DiffLine>, number: Option<usize>) -> Div {
             if let Some(bg) = bg {
                 cell = cell.bg(rgb(bg));
             }
-            cell.child(
+            let cell = cell.child(
                 div()
                     .flex_1()
                     .min_w_0()
@@ -3682,7 +3682,19 @@ fn split_cell(line: Option<&diff::DiffLine>, number: Option<usize>) -> Div {
                     } else {
                         line.text.clone()
                     }),
-            )
+            );
+            if line.no_newline {
+                cell.child(
+                    div()
+                        .flex_shrink_0()
+                        .px_2()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child("改行なし"),
+                )
+            } else {
+                cell
+            }
         }
         None => cell.bg(rgb(CANVAS)).child(div().flex_1()),
     }

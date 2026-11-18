@@ -19,6 +19,8 @@ pub struct DiffLine {
     pub kind: DiffLineKind,
     /// 末尾の改行を除く原文（先頭の記号を含む）。
     pub text: String,
+    /// この行の末尾には改行がない（Git の直後のメタ行から取得）。
+    pub no_newline: bool,
     /// 旧ファイルの行番号（Context / Removed のみ）。
     pub old_lineno: Option<usize>,
     /// 新ファイルの行番号（Context / Added のみ）。
@@ -41,13 +43,23 @@ fn hunk(text: &str) -> Option<((usize, usize), (usize, usize))> {
 /// unified diff テキストを構造化する。行番号は各ハンクから数える。
 pub fn parse_unified_diff(text: &str) -> Vec<DiffLine> {
     use DiffLineKind::*;
-    let mut result = Vec::new();
+    let mut result: Vec<DiffLine> = Vec::new();
     let (mut old, mut new) = (None, None);
     let (mut old_left, mut new_left) = (0usize, 0usize);
     for text in text.lines() {
+        if text == "\\ No newline at end of file" {
+            if let Some(previous) = result
+                .last_mut()
+                .filter(|line| matches!(line.kind, Context | Added | Removed))
+            {
+                previous.no_newline = true;
+                continue;
+            }
+        }
         let mut line = DiffLine {
             kind: Meta,
             text: text.to_owned(),
+            no_newline: false,
             old_lineno: None,
             new_lineno: None,
         };
@@ -182,12 +194,76 @@ mod tests {
     }
 
     #[test]
-    fn newline_marker_is_meta() {
-        let lines = parse_unified_diff("@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b");
-        assert_eq!(lines[2].kind, DiffLineKind::Meta);
-        assert_eq!((lines[2].old_lineno, lines[2].new_lineno), (None, None));
-        assert_eq!(lines[3].new_lineno, Some(1));
-        assert!(matches!(&to_split_rows(&lines)[2], SplitRow::Full(l) if l == &lines[2]));
+    fn newline_marker_is_attached_without_breaking_replacement_pair() {
+        let lines = parse_unified_diff(
+            "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n",
+        );
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].no_newline);
+        assert!(lines[2].no_newline);
+        assert_eq!(lines[1].old_lineno, Some(1));
+        assert_eq!(lines[2].new_lineno, Some(1));
+        assert_eq!(
+            to_split_rows(&lines)[1],
+            SplitRow::Pair(Some(lines[1].clone()), Some(lines[2].clone()))
+        );
+        assert!(
+            matches!(&to_split_rows(&parse_unified_diff("\\ No newline at end of file"))[0], SplitRow::Full(line) if line.kind == DiffLineKind::Meta)
+        );
+    }
+
+    #[test]
+    fn real_git_newline_markers_keep_the_correct_side() {
+        use std::process::Command;
+        let directory =
+            std::env::temp_dir().join(format!("eren-newline-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for (old, new, old_missing, new_missing) in [
+            ("old", "new", true, true),
+            ("old", "new\n", true, false),
+            ("old\n", "new", false, true),
+            ("old\n", "new\n", false, false),
+        ] {
+            std::fs::write(directory.join("old"), old).unwrap();
+            std::fs::write(directory.join("new"), new).unwrap();
+            let output = Command::new("git")
+                .args(["diff", "--no-index", "--", "old", "new"])
+                .current_dir(&directory)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            let lines = parse_unified_diff(&String::from_utf8(output.stdout).unwrap());
+            let rows = to_split_rows(&lines);
+            let pairs: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    SplitRow::Pair(Some(old), Some(new)) => Some((old, new)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pairs.len(), 1, "{rows:?}");
+            assert_eq!(pairs[0].0.text, "-old");
+            assert_eq!(pairs[0].1.text, "+new");
+            assert_eq!(pairs[0].0.no_newline, old_missing);
+            assert_eq!(pairs[0].1.no_newline, new_missing);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn markers_do_not_pair_across_hunks_or_file_headers() {
+        let lines = parse_unified_diff("@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n@@ -4 +4 @@\n-c\n+d\n\\ No newline at end of file\ndiff --git a/next b/next\n@@ -1 +1 @@\n-e\n+f");
+        let rows = to_split_rows(&lines);
+        let pairs: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SplitRow::Pair(Some(old), Some(new)) => {
+                    Some((old.text.as_str(), new.text.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pairs, [("-a", "+b"), ("-c", "+d"), ("-e", "+f")]);
     }
 
     #[test]
