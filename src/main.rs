@@ -606,6 +606,7 @@ impl Workbench {
                             changed = true;
                         }
                         for tab in &mut this.sessions {
+                            tab.session.process_events();
                             if tab
                                 .session
                                 .wake
