@@ -150,12 +150,9 @@ fn ensure_children(entries: &mut [TreeEntry], dir: &Path) -> bool {
     false
 }
 
-/// .git/HEAD からブランチ名を読む（worktree 等で読めなければ None）。
+/// Git 自身に HEAD を解決させる。失敗時は既存の「Git 連携」表示へ戻す。
 fn git_branch(root: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
-    let head = head.trim();
-    head.strip_prefix("ref: refs/heads/")
-        .map(|name| name.to_string())
+    git_changes::branch(root).ok()
 }
 
 #[derive(Clone)]
