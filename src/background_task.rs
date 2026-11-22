@@ -113,6 +113,28 @@ mod tests {
         assert!(!task.is_running());
     }
     #[test]
+    fn project_invalidation_discards_late_result_without_starting_replacement() {
+        let mut task = BackgroundTask::default();
+        let (release, gate) = mpsc::channel();
+        let (started, ready) = mpsc::channel();
+        task.submit(move |cancel| {
+            started.send(()).unwrap();
+            gate.recv().unwrap();
+            assert!(cancel.is_cancelled());
+            42
+        });
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        task.invalidate();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while task.is_running() {
+            assert!(task.poll().is_none());
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
     fn invalidated_and_failed_workers_do_not_leave_task_busy() {
         let mut task = BackgroundTask::<()>::default();
         task.submit(|_| panic!("simulated worker failure"));
