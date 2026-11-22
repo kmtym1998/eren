@@ -29,14 +29,23 @@ pub fn read_document(path: &Path) -> io::Result<String> {
 
 pub fn conflicts(path: &Path, baseline: &[u8]) -> io::Result<bool> {
     match std::fs::File::open(path) {
-        Ok(file) => {
-            // 外部で巨大化しても、保存前の比較で上限なしに読み込まない。
-            if file.metadata()?.len() > MAX_DOCUMENT_BYTES {
+        Ok(mut file) => {
+            // 自分の保存済み文書が2MiBを超えていても、固定バッファで比較する。
+            // 外部で巨大化した場合は長さで拒否し、読み込み中の変化も末尾まで検出する。
+            if file.metadata()?.len() != baseline.len() as u64 {
                 return Ok(true);
             }
-            let mut bytes = Vec::new();
-            file.take(MAX_DOCUMENT_BYTES + 1).read_to_end(&mut bytes)?;
-            Ok(bytes != baseline)
+            let mut buffer = [0u8; 8192];
+            let mut offset = 0;
+            while offset < baseline.len() {
+                let length = buffer.len().min(baseline.len() - offset);
+                let read = file.read(&mut buffer[..length])?;
+                if read == 0 || buffer[..read] != baseline[offset..offset + read] {
+                    return Ok(true);
+                }
+                offset += read;
+            }
+            Ok(file.read(&mut buffer[..1])? != 0)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
@@ -173,6 +182,27 @@ mod tests {
         assert!(conflicts(&path, b"base").unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn conflict_check_accepts_large_self_saved_baseline_and_bounds_external_growth() {
+        let dir = directory();
+        let path = dir.join("large");
+        let mut baseline = vec![b'a'; MAX_DOCUMENT_BYTES as usize + 1];
+        atomic_save(&path, &baseline).unwrap();
+        assert!(!conflicts(&path, &baseline).unwrap());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"extra")
+            .unwrap();
+        assert!(conflicts(&path, &baseline).unwrap());
+        baseline[0] = b'b';
+        atomic_save(&path, &baseline).unwrap();
+        baseline[0] = b'a';
+        assert!(conflicts(&path, &baseline).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn preserves_symlink_and_permissions() {
