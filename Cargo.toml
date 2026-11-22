@@ -2,7 +2,7 @@
 name = "eren"
 version = "0.1.0"
 edition = "2021"
-description = "A Sirio/Herdr-like native workspace for coding agents: project sidebar, code viewer with LSP jumps, diffs and (later) terminals."
+description = "A native workspace for coding agents with terminal sessions, file editing, LSP navigation, search, and Git diffs."
 license = "MIT"
 
 [dependencies]

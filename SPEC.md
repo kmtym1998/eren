@@ -1,76 +1,78 @@
-# eren — 仕様メモ（作業用）
+# eren 仕様メモ
 
-Sirio / Herdr 風の、coding agent のためのネイティブ・ワークスペースを新規に作る。
-Sirio の fork ではなく、GPUI + gpui-kit でゼロから組む（2026-11-15 決定）。
-リポジトリは kmtym1998/eren（public — 2026-11-15 に Homebrew 配布のためユーザーが public 化）。
+2026-11-22時点の実装と残作業。Rust、GPUI、gpui-kitで作るネイティブワークスペース。リポジトリは [kmtym1998/eren](https://github.com/kmtym1998/eren)（public）。
 
-## 確定した方針
+## UIと構成
 
-- UI は GPUI（Zed の GPU フレームワーク）+ gpui-kit（gpui-component 等の umbrella crate、依存は `gpui-kit` 1本に寄せる）
-- VSCode / Monaco の埋め込みはしない。ビューアは GPUI ネイティブで作る
-- コードジャンプは LSP を使う（簡易ジャンプ＝tree-sitter 名前引きは採用しない）
-  - 対象：definition / declaration / typeDefinition / implementation / references / hover / documentSymbol
-  - 飛ぶ系は全部「位置 → Location 群」で同型なので、`goto(kind, position)` に共通化する
-  - 複数候補はピッカー、ナビゲーション履歴（戻る / 進む）を必須とする
-  - 対応はサーバーの capability を見て出し分ける
-- ファイル編集も対象にする（2026-11-15 ユーザー要望で、当初の読み取り専用前提から変更）。LSP 同期は全文同期のみ（外部変更時は開き直し）。補完・rename・整形は対象外
-- 言語サーバーは最初 rust-analyzer のみ、次に TypeScript を足す
+ターミナルを中央ペインの主役にする。左にプロジェクト・worktree・セッション、右にGit Changesを置く。エディタはファイルを開くかトグル操作したときに表示し、端末と並べる。差分表示と通常編集を切り替えても未保存の文書を保持する。
 
-## UI の形（2026-11-15 ユーザー指示で変更）
+本体は `gpui-kit` 経由でGPUIを使う。GPUIのテスト支援だけは、kitと同じ `gpui-pre` の固定版をdev-dependencyに持つ。ターミナルは `alacritty_terminal` がPTYとVTグリッドを管理し、GPUI側で描画・入力を扱う。
 
-- Herdr のように **ターミナルがメイン**。中央ペインは既定でターミナルが占める
-- エディタは常時表示しない。ファイルを開いたとき／トグル操作のときだけ、ターミナルの横（または上）に表示する
-- これに伴い、ターミナル（Phase 3 の予定だったもの）を Phase 1 の次に前倒しする
+## 実装済み
 
-## MVP スコープ
+### プロジェクト・編集・検索
 
-### Phase 1（ビューア核）
-- [ ] ウィンドウ + 3ペイン骨格（左：プロジェクト/agent、中央：ビューア、右：Changes）← 土台は作成済み
-- [x] プロジェクトを開く（フォルダ選択 → ファイルツリー表示、`.git/HEAD` からブランチ名表示。CLI 引数でフォルダを渡しても開ける）
-- [x] worktree 一覧と切替（2026-11-16、Codex が `src/worktrees.rs` を実装・助手が統合）：`git worktree list --porcelain` をパースし、2件以上あるときサイドバーに「ワークツリー」欄を出す。クリックでそのフォルダをプロジェクトとして開き直す。実リポジトリ＋linked worktree で表示と切替を GUI 確認済み
-- [x] 差分の split（左右）表示（2026-11-16、Codex が `src/diff.rs` を実装・助手が統合）：差分ビューのヘッダーに「分割 / 統合」トグルを追加。分割時は unified diff をパースして旧・新を行番号付きで左右に並べ、削除のみ・追加のみの行は反対側を空セルにする。実リポジトリの差分でペアリングと行番号を GUI 確認済み
-- [x] ファイルツリー → コードエディタ（EditorState 化済み 2026-11-15：そのまま編集でき、保存ボタン / Cmd+S・Ctrl+S で保存、未保存はドット表示。tree-sitter ハイライトは rust / typescript / tsx / javascript / toml / markdown / css / html / bash / yaml / python + json に対応。未保存のまま別ファイルへ切り替える際は確認バーで「保存して開く／破棄して開く／キャンセル」を選ぶ。ローカル実装済み 2026-11-15、未 push）
-- [x] Changes：git status の変更一覧 + Diff 表示（unified、2026-11-15 ローカル実装）：右ペインに件数バッジ付きで変更ファイルを一覧（XY ステータスの色分けバッジ、更新ボタン、保存時にも自動更新）。クリックで `git diff HEAD`（未追跡は /dev/null との diff）を色付きでエディタ領域に表示。split 表示は今後の拡張
-- [x] 横断検索（2026-11-15 実装）：ツリーパネル上部の入力欄に語を入れて Enter で、ignore クレートでプロジェクトを走査（.gitignore 尊重、2MB 超とバイナリは除外）し、部分一致（大文字小文字を区別しない、上限300件）の結果一覧を表示。クリックでファイルを開いて該当行へジャンプ（未保存時は確認バーを経由）
+- フォルダ選択またはCLI引数でプロジェクトを開く。ファイルツリー、ブランチ名、Git worktree一覧を表示し、worktreeを切り替えられる。
+- UTF-8のファイルを編集・保存する。不正UTF-8、NULを含むファイル、2 MiB超はエディタで開かない。構文ハイライトはRust、TypeScript/TSX、JavaScript、TOML、Markdown、CSS、HTML、Bash、YAML、Python、JSONに対応する。
+- 未保存のままファイルや履歴上の別の文書へ移動する場合は、保存・破棄・キャンセルを選ぶ。読み込みや保存に失敗した場合も、現在の文書を保持する。
+- 約1秒ごとに外部変更を検知する。未編集ならカーソル位置を保って読み直し、未保存なら警告する。保存前にはディスク内容と比較して競合を確認する。一時ファイルへの書き込み後に置き換え、シンボリックリンクと権限を保持する。
+- `.gitignore`を尊重する横断検索。小文字化による部分一致で、Unicodeの検索位置を元の列へ戻す。1行1件、上限300件。2,000,000 bytes超とバイナリを検索対象から除く。
+- Gitルート基準のChanges一覧と統合・左右分割の差分表示。サブフォルダから開いてもリポジトリ全体を基準に扱い、初回コミット前のstaged差分、未追跡、Gitが検出したリネーム・コピーの元パスを含む差分も表示する。Gitの失敗は差分なしと区別して通知する。
 
-### Phase 2（LSP）
-- [x] LSP クライアント基盤（2026-11-15 実装）：`src/lsp.rs` に自前の最小 JSON-RPC クライアント（stdio、読み取り専用スレッド＋同期リクエスト、全文同期）。当初案の async-lsp は使わず同期スレッド方式にした（GPUI のバックグラウンドタスクから呼ぶ）。initialize で capabilities を保持し、対応可否でジャンプを出し分ける
-- [x] rust-analyzer で definition / implementation ジャンプ（2026-11-15 実装）：プロジェクト（Cargo.toml あり）を開くとバックグラウンドで自動起動。F12=定義、Ctrl+F12=実装、エディタヘッダーにもボタン。複数ヒットは候補リスト、戻る/進む履歴（Alt+←/→）付き。UTF-16 位置変換あり（単体テスト＋実サーバー結合テスト＋GUI 確認済み）。rust-analyzer は rustup の shim ではなく toolchain 実体を優先して解決する
-- [x] references / hover / 診断表示（2026-11-15 実装）：Shift+F12・ヘッダー「参照」で参照検索（候補リスト表示）。hover はエディタ組み込みの HoverProvider に自前クライアントを接続し、実サーバーの内容を表示。診断は publishDiagnostics を取り込み、エディタ上部に重大度つきのバーを表示（クリックで該当行へジャンプ、40ms ポーリングで更新）
-- [x] TypeScript サーバー対応（2026-11-16）：package.json のあるプロジェクトでは PATH 上の typescript-language-server を `--stdio` で起動（Cargo.toml があれば rust-analyzer を優先）。言語 ID は拡張子から判定（rs / ts / tsx / js / jsx）し、サーバーが扱える言語だけ didOpen する。GUI で定義ジャンプと hover を確認済み。前提：プロジェクト側に typescript が入っていること（サーバーが workspace 内を探す）。見つからない場合はステータスに理由を表示
-- [x] 外部変更の再同期（2026-11-16）：開いているファイルの更新時刻＋内容ハッシュを約1秒ごとにポーリング。未保存の変更がなければ自動で読み直し（カーソル位置を保持、LSP へも再同期）、あれば上書きせずステータスに警告。削除も一度だけ通知する。notify クレートは使わずポーリングで実装
-- [x] index 進捗表示（2026-11-16）：`$/progress`（workDoneProgress）をクライアントで保持し、ステータスバーに「LSP: タイトル 進捗%: メッセージ」形式で表示。rust-analyzer の Fetching / Roots Scanned が実際に出ることを GUI で確認済み。これで Phase 2 は完了
-- [x] documentSymbol のシンボル一覧（2026-11-16、Codex が `src/symbols.rs` を実装・助手が統合）：エディタヘッダーの「シンボル」ボタン / Cmd+Shift+O・Ctrl+Shift+O で現在のファイルのシンボル一覧パネルを出し、クリックでその位置へジャンプ（履歴にも積む）。rust-analyzer の実応答で表示とジャンプを GUI 確認済み。ついでにエディタヘッダーのボタンを xsmall 化し、タイトル省略と overflow_hidden で狭い幅でも Changes 側へはみ出さないようにした
+### LSP
 
-### Phase 3（ターミナル + agent 管理）
-- [x] ターミナル pane の土台（前倒しで実施、2026-11-15 ローカル実装）：alacritty_terminal 0.25 + PTY でログインシェルをプロジェクトフォルダで起動。グリッド描画（色・太字・反転・ブロックカーソル）、キー入力（Ctrl 組み合わせ・矢印・Alt プレフィックス）、ペインサイズへの追従（canvas 実測で cols/rows を再計算）。中央ペインの主役として常時表示され、エディタはトグル表示。残り：マウス選択・コピー、日本語 IME 入力、複数ターミナル
-- [x] スクロールバック（2026-11-15 ローカル実装）：履歴 10,000 行を保持し、ホイール／Shift+PageUp・PageDown で遡れる。遡っている間は右下にバッジを出し、キー入力で最下部へ戻る
-- [x] ターミナルのマウス選択＋コピー／ペースト（2026-11-16）：ドラッグでセル範囲を選択（ハイライト表示）、Cmd+C / Ctrl+Shift+C でコピー、Cmd+V / Ctrl+Shift+V でペースト。入力・スクロール・セッション切替で選択解除。残りは日本語 IME のみ
-- [x] ターミナルのリンク Cmd+クリック（2026-11-16、Codex が `src/links.rs` を実装・助手が統合）：ターミナル出力中の URL とファイルパス（`src/main.rs:12:5` 形式の行列サフィックス付き）を Cmd+クリックで開く。URL は OS のブラウザ、ファイルパスはプロジェクト相対で解決してエディタで該当行へジャンプ。`hello.txt:2` のクリックでエディタが開き2行目に移動することを GUI 確認済み（URL を開く先は VM では観測できないため未確認）
-- [~] ターミナルの日本語 IME 入力（2026-11-16 実装、Mac 実機での変換確認待ち）：GPUI の `EntityInputHandler` を Workbench に実装し、ターミナルの canvas の paint で `Window::handle_input` を登録。変換中文字列（marked text）はカーソル位置に重ねて表示し、確定した文字列だけを PTY へ送る。変換中はキー入力を IME に任せる（キーゲート）。候補ウィンドウの位置は Snapshot に追加したカーソル座標から返す。VM には日本語入力環境がないため、通常入力に回帰がないこと（文字の重複・欠落なし）と UTF-16 変換ヘルパーの単体テストまで確認済み。実際の変換・候補選択・確定の確認は Mac 実機で行う
-- [x] 複数セッション＋agent 起動と状態表示（2026-11-16）：サイドバーにセッション一覧（クリックで切替、×で終了、状態ドット）。追加ボタンからシェル／Claude Code／Codex／OpenCode を起動でき、エージェント終了後はシェルに落ちる。状態は可視テキストからのヒューリスティクス判定（`src/agents.rs`：作業中=青／入力待ち=琥珀／不明=灰）で、Codex の入力待ち検出を実機相当の TUI で確認済み
-- [x] レイアウト永続化（2026-11-16）：プロジェクト・セッション構成・アクティブセッション・開いているファイル・エディタ表示状態を `~/.local/state/eren/state.json` に保存し、引数なし起動時に復元（プロセスは作り直し）。終了→再起動で Codex セッション＋ファイルが復元されることを GUI で確認済み
-- [ ] プロセス永続化（終了してもプロセスが生きる仕組みは Herdr / Sirio の background host 方式を参考。将来課題）
+stdioのJSON-RPCクライアントを使う。読み取り専用スレッドとバックグラウンド要求でUIへ結果を返す。プロジェクト、文書、要求の版を確認し、古い結果が別の表示へ混ざらないようにする。切断・終了・起動取消時には要求と子プロセスを解放する。
 
-## 既知の制約・注意
+Rustプロジェクトではrust-analyzerを自動起動し、rustupのshimよりtoolchain内の実体を優先する。`package.json`のあるプロジェクトではPATH上の `typescript-language-server --stdio` を使う。TypeScript本体はプロジェクト側に必要。両方の設定ファイルがある場合はRustを優先する。
 
-- GPUI は pre-1.0。gpui-kit が pin する gpui-pre スナップショットに追随する（kit 経由で使うので直接 GPUI を依存に書かない）
-- gpui-component の Editor は LSP を Provider trait（Completion / Hover / Definition / CodeAction）で受ける設計。implementation は trait に無い可能性があり、その場合は独自アクションから LSP クライアントを直接叩く
-- 開発 VM（Muse 側）は GUI が無いので実機確認はユーザーのマシンで `cargo run` する。VM 側では `cargo check` まで
-- Sirio は MIT だが無名の個人プロジェクト（stars 0 / 2026-07 開始）。fork はしないが、ターミナル等の実装は参考にする
+対応するUIは定義、実装、参照、hover、診断、documentSymbol一覧、戻る・進む履歴。サーバーのcapabilityを確認して要求し、対応言語の文書をopen/change/closeで同期する。変更同期は全文で、UTF-16の位置を変換する。hoverは文字列・言語付き内容・配列・MarkupContentを扱う。`$/progress`をステータスバーへ表示する。
 
-## 動かし方
+### ターミナル・エージェント
+
+プロジェクト内でログインシェルを起動する。複数セッションを持ち、Claude Code、Codex、OpenCodeも起動できる。各CLIはPATH上に必要。エージェントのコマンドが終了するとシェルへ移る。
+
+- ANSI16色、256色、truecolor、背景、反転、OSC色変更・リセットと問い合わせ応答。
+- 全角・結合文字、行末折り返し、セル幅に対応したカーソル・選択・コピー・リンク位置。
+- 履歴10,000行。ホイールまたはShift+PageUp/PageDownで移動し、通常入力で最下部へ戻る。端末へのプロトコル応答では履歴位置を変えない。
+- 選択したテキストのコピー、貼り付け、URLとファイルパスのCmd+クリック。APP_CURSORとBRACKETED_PASTEに応じて入力を符号化する。
+- IMEのmarked textをカーソル位置へ表示し、確定時にだけ送信する。変換開始時のセッションIDを保持し、切り替え・追加後も元の端末へ確定する。元の端末を閉じた場合は捨てる。Ctrl+Shift+Jは入力ソース切り替えに渡し、Ctrl+J単独は維持する。
+- シェル終了コードと終了状態を表示し、入力を止め、再起動・閉じる操作を用意する。起動失敗の通知は既存端末の表示と分ける。
+
+エージェントの「作業中」「入力待ち」「不明」は可視テキストからの推定。CLIの表示変更や画面に残った出力で誤判定する場合がある。シェル自体の終了状態は、推定とは別にPTYの子の終了通知から得る。
+
+### 構成の復元
+
+`~/.local/state/eren/state.json` にプロジェクト、セッション構成、アクティブセッション、開いたファイル、エディタ表示状態を保存する。引数なし起動で復元し、復元途中の状態で保存内容を上書きしない。保存は原子的に置き換える。端末のプロセスと出力履歴は復元せず、プロセスは起動し直す。
+
+## 確認済みの範囲と残作業
+
+単体・fake LSP server・実PTYの回帰テストを持つ。Mac GUIでは日本語の確定、Ctrl+Shift+Jで改行が増えないこと、日本語コピー、全角・結合文字・絵文字、ANSI16色、ブロック・下線・バーのカーソルを確認した。設定を隔離したzshの終了コード7表示と再起動も確認済み。
+
+IMEの候補選択・取消・再変換と、変換途中のセッション追加・終了・プロジェクト切り替えを組み合わせた実機確認は未完了。変換の確定先は回帰テストで検証している。実rust-analyzer結合テストは通常のテストから除外し、明示的に起動する。TypeScriptと各エージェントCLIの実機確認は別に必要。
+
+終了コードはPTYの直接の子の値。ユーザーのシェル設定がKiroなどのラッパーを挟む場合、内側のシェルが7で終わってもラッパーは0で終わることがある。設定を変更せずに切り分ける場合は、アプリの起動環境で空のZDOTDIRを指定する。
+
+検索・Git・外部変更検知には同期I/Oが残る（[#18](https://github.com/kmtym1998/eren/issues/18)）。未解決の項目は、linked worktree・サブフォルダのブランチ名表示（[#48](https://github.com/kmtym1998/eren/issues/48)）、末尾改行なしの分割差分（[#31](https://github.com/kmtym1998/eren/issues/31)）、引用付きリンクの空白（[#32](https://github.com/kmtym1998/eren/issues/32)）、worktreeパス内の改行（[#33](https://github.com/kmtym1998/eren/issues/33)）。最新の状態は [Issue一覧](https://github.com/kmtym1998/eren/issues?q=is%3Aissue+is%3Aopen) で管理する。新しい修正が入ったmainと、古い配布バイナリの挙動は区別する。
+
+## 今後の対象
+
+- アプリ終了後もプロセスを維持する常駐ホスト。
+- LSPのdeclaration/typeDefinitionを開くUI。補完、rename、LSPによる整形。
+- `.app`とCaskによる配布、公証。Homebrew tap公開はユーザー判断で保留している。
+
+Windowsは現時点の対象外。LinuxとIntel Macはビルド設定があるが、すべてのGUI・IME操作を検証した対応環境とはしていない。
+
+## 開発と配布
+
+開発の前提と検証コマンドは [README.md](README.md) を参照。`rust-toolchain.toml` の固定Rustとコミット済みのCargo.lockを使う。PRとmainへのpushではMacのCIがfmt・テスト・Clippy・ネイティブビルドを実行する。Python要件、キャッシュ、Intel/Linuxと実LSP・GUIの確認範囲は [docs/ci.md](docs/ci.md) に記載する。通常の確認は次のとおり。
 
 ```bash
-cargo run
+cargo fmt --all --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked
 ```
 
-要 Rust 安定版ツールチェイン。
+[v0.1.0](https://github.com/kmtym1998/eren/releases/tag/v0.1.0) のmacOS arm64・Intel・Linux x86_64用成果物は既に存在する。現在の修正を配布したリリースではない。tapの公開とbrew導入確認は保留中で、過去の成果物があることとは分けて扱う。
 
-## 配布（Homebrew）
-
-- リリースは GitHub Actions（`.github/workflows/release.yml`）で、`v*` タグを push すると macOS arm64 / macOS Intel（cross）/ Linux x86_64 の release バイナリを tar.gz + sha256 にして GitHub Release へ添付する
-- Homebrew は個人 tap `kmtym1998/homebrew-tap` の Formula で配る想定。雛形は `dist/homebrew/eren.rb`（tarball を落として `bin/eren` を入れるだけ、test は `eren --version`）
-- **前提：release の tarball は認証なしで落とせる必要があるので、配布を始める時点で eren repo を public にする**（private のままだと他人の brew が 404 になる）
-- `brew install kmtym1998/tap/eren` で入ってターミナルから `eren` で起動、が v0 の形。.app 化 + Cask 化と公証（notarization）は後続
-- バイナリは `--version` / `--help` を画面なしで処理する（formula の test とスクリプト用）
+`release.yml` はタグpushでリリース公開、手動実行でActionsの成果物を作る設定。新規リリースとtap公開は保留中。配布再開時は対象ごとのreleaseビルドと起動を確認する。既存成果物とtap再開の手順は [HOMEBREW.md](HOMEBREW.md) にある。
