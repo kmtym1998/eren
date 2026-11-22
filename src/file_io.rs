@@ -3,12 +3,21 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub const MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;
+
 pub fn read_document(path: &Path) -> io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "通常ファイルではないか 2 MB を超えている",
+        ));
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
-        .take(2 * 1024 * 1024 + 1)
+        .take(MAX_DOCUMENT_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > 2 * 1024 * 1024 || bytes.contains(&0) {
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES || bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "2 MB 超またはバイナリのファイルは開けない",
@@ -19,8 +28,25 @@ pub fn read_document(path: &Path) -> io::Result<String> {
 }
 
 pub fn conflicts(path: &Path, baseline: &[u8]) -> io::Result<bool> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(bytes != baseline),
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            // 自分の保存済み文書が2MiBを超えていても、固定バッファで比較する。
+            // 外部で巨大化した場合は長さで拒否し、読み込み中の変化も末尾まで検出する。
+            if file.metadata()?.len() != baseline.len() as u64 {
+                return Ok(true);
+            }
+            let mut buffer = [0u8; 8192];
+            let mut offset = 0;
+            while offset < baseline.len() {
+                let length = buffer.len().min(baseline.len() - offset);
+                let read = file.read(&mut buffer[..length])?;
+                if read == 0 || buffer[..read] != baseline[offset..offset + read] {
+                    return Ok(true);
+                }
+                offset += read;
+            }
+            Ok(file.read(&mut buffer[..1])? != 0)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
     }
@@ -156,6 +182,27 @@ mod tests {
         assert!(conflicts(&path, b"base").unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn conflict_check_accepts_large_self_saved_baseline_and_bounds_external_growth() {
+        let dir = directory();
+        let path = dir.join("large");
+        let mut baseline = vec![b'a'; MAX_DOCUMENT_BYTES as usize + 1];
+        atomic_save(&path, &baseline).unwrap();
+        assert!(!conflicts(&path, &baseline).unwrap());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"extra")
+            .unwrap();
+        assert!(conflicts(&path, &baseline).unwrap());
+        baseline[0] = b'b';
+        atomic_save(&path, &baseline).unwrap();
+        baseline[0] = b'a';
+        assert!(conflicts(&path, &baseline).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn preserves_symlink_and_permissions() {
