@@ -15,7 +15,7 @@ pub struct Worktree {
     pub prunable: bool,
 }
 
-/// `git worktree list --porcelain` の出力をパースする。
+/// `git worktree list --porcelain -z` の出力をパースする。
 pub fn parse_worktree_list(output: &str) -> Vec<Worktree> {
     fn finish(current: &mut Option<Worktree>, result: &mut Vec<Worktree>) {
         if let Some(mut worktree) = current.take() {
@@ -28,7 +28,7 @@ pub fn parse_worktree_list(output: &str) -> Vec<Worktree> {
 
     let mut result = Vec::new();
     let mut current: Option<Worktree> = None;
-    for line in output.lines() {
+    for line in output.split('\0') {
         if line.is_empty() {
             finish(&mut current, &mut result);
         } else if let Some(path) = line.strip_prefix("worktree ") {
@@ -68,11 +68,11 @@ pub fn parse_worktree_list(output: &str) -> Vec<Worktree> {
     result
 }
 
-/// 指定フォルダで `git worktree list --porcelain` を実行して一覧を返す。
+/// 指定フォルダで `git worktree list --porcelain -z` を実行して一覧を返す。
 /// git リポジトリでない場合や git が失敗した場合は Err(理由の文字列)。
 pub fn list_worktrees(root: &Path) -> Result<Vec<Worktree>, String> {
     let output = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
+        .args(["worktree", "list", "--porcelain", "-z"])
         .current_dir(root)
         .output()
         .map_err(|error| format!("git を実行できなかった: {error}"))?;
@@ -94,8 +94,8 @@ mod tests {
     #[test]
     fn two_branch_worktrees_with_spaces() {
         let worktrees = parse_worktree_list(
-            "worktree /repo/main\nHEAD abc123\nbranch refs/heads/main\n\n\
-             worktree /repo/feature worktree\nHEAD def456\nbranch refs/heads/feature/topic\n\n",
+            "worktree /repo/main\0HEAD abc123\0branch refs/heads/main\0\0\
+             worktree /repo/feature worktree\0HEAD def456\0branch refs/heads/feature/topic\0\0",
         );
         assert_eq!(
             worktrees,
@@ -123,8 +123,8 @@ mod tests {
     }
 
     #[test]
-    fn detached_worktree_without_final_newline() {
-        let worktrees = parse_worktree_list("worktree /repo/detached\nHEAD abc123\ndetached");
+    fn detached_worktree_without_final_delimiter() {
+        let worktrees = parse_worktree_list("worktree /repo/detached\0HEAD abc123\0detached");
         assert_eq!(worktrees.len(), 1);
         assert!(worktrees[0].detached);
         assert_eq!(worktrees[0].head.as_deref(), Some("abc123"));
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn bare_worktree() {
-        let worktrees = parse_worktree_list("worktree /repo/bare.git\nbare\n\n");
+        let worktrees = parse_worktree_list("worktree /repo/bare.git\0bare\0\0");
         assert_eq!(worktrees.len(), 1);
         assert!(worktrees[0].bare);
         assert_eq!(worktrees[0].head, None);
@@ -144,8 +144,8 @@ mod tests {
 
     #[test]
     fn locked_and_prunable_with_and_without_reasons() {
-        for flags in ["locked\nprunable", "locked in use\nprunable gitdir missing"] {
-            let worktrees = parse_worktree_list(&format!("worktree /repo/task\n{flags}\n"));
+        for flags in ["locked\0prunable", "locked in use\0prunable gitdir missing"] {
+            let worktrees = parse_worktree_list(&format!("worktree /repo/task\0{flags}\0"));
             assert_eq!(worktrees.len(), 1);
             assert!(worktrees[0].locked);
             assert!(worktrees[0].prunable);
@@ -155,14 +155,14 @@ mod tests {
     #[test]
     fn empty_output() {
         assert!(parse_worktree_list("").is_empty());
-        assert!(parse_worktree_list("\n\n").is_empty());
+        assert!(parse_worktree_list("\0\0").is_empty());
     }
 
     #[test]
-    fn ignores_unknown_lines_and_blocks_without_paths() {
+    fn ignores_unknown_fields_and_records_without_paths() {
         let worktrees = parse_worktree_list(
-            "HEAD orphan\nunknown\n\nworktree \nlocked\n\n\
-             worktree /repo/task\nunknown value\nlockedness\nprunables\n\n\n",
+            "HEAD orphan\0unknown\0\0worktree \0locked\0\0\
+             worktree /repo/task\0unknown value\0lockedness\0prunables\0\0\0",
         );
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].path, PathBuf::from("/repo/task"));
@@ -172,9 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn handles_crlf_and_missing_block_separator() {
+    fn handles_missing_record_separator() {
         let worktrees = parse_worktree_list(
-            "worktree /repo/main\r\nbranch refs/heads/main\r\nworktree /repo/other\r\ndetached\r\n",
+            "worktree /repo/main\0branch refs/heads/main\0worktree /repo/other\0detached\0",
         );
         assert_eq!(worktrees.len(), 2);
         assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
@@ -186,13 +186,90 @@ mod tests {
     fn detached_and_bare_never_have_branches() {
         for flag in ["detached", "bare"] {
             for fields in [
-                format!("branch refs/heads/main\n{flag}"),
-                format!("{flag}\nbranch refs/heads/main"),
+                format!("branch refs/heads/main\0{flag}"),
+                format!("{flag}\0branch refs/heads/main"),
             ] {
-                let worktrees = parse_worktree_list(&format!("worktree /repo/task\n{fields}"));
+                let worktrees = parse_worktree_list(&format!("worktree /repo/task\0{fields}"));
                 assert_eq!(worktrees[0].branch, None);
             }
         }
+    }
+
+    #[test]
+    fn whitespace_inside_paths_and_reasons_is_not_a_field_separator() {
+        let path = "/repo/日本語 space\ttab\nnewline\r";
+        let output = format!(
+            "worktree {path}\0HEAD abc\0branch refs/heads/topic\0locked reason\nwith newline\0\0"
+        );
+        let parsed = parse_worktree_list(&output);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, PathBuf::from(path));
+        assert_eq!(parsed[0].branch.as_deref(), Some("topic"));
+        assert!(parsed[0].locked);
+    }
+
+    #[test]
+    fn real_git_worktrees_preserve_spaces_japanese_tabs_and_newlines() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "eren-worktree-paths-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let repository = directory.join("main repo");
+        std::fs::create_dir(&repository).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "--template="]);
+        git(&["commit", "--allow-empty", "-qm", "fixture"]);
+        let mut expected = vec![repository.canonicalize().unwrap()];
+        for (index, name) in ["space path", "日本語", "tab\tpath", "newline\npath"]
+            .into_iter()
+            .enumerate()
+        {
+            let path = directory.join(name);
+            git(&[
+                "worktree",
+                "add",
+                "-qb",
+                &format!("fixture-{index}"),
+                path.to_str().unwrap(),
+            ]);
+            expected.push(path.canonicalize().unwrap());
+        }
+        for root in [&repository, &expected[4]] {
+            let parsed = list_worktrees(root).unwrap();
+            assert_eq!(parsed.len(), expected.len());
+            let mut actual: Vec<_> = parsed.into_iter().map(|entry| entry.path).collect();
+            actual.sort();
+            let mut expected = expected.clone();
+            expected.sort();
+            assert_eq!(actual, expected);
+            assert!(actual.iter().all(|path| path.is_dir()));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
