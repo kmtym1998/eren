@@ -1017,7 +1017,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn rust_analyzer_definition() {
-        let dir = std::env::temp_dir().join("eren-lsp-fixture");
+        let dir = std::env::temp_dir().join(format!("eren-lsp-fixture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
@@ -1035,9 +1035,16 @@ pub(crate) mod tests {
         let call_offset = source.rfind("helper()").unwrap();
         let mut locations = Vec::new();
         for _ in 0..30 {
-            locations = client
-                .goto("textDocument/definition", &main_rs, source, call_offset)
-                .expect("definition");
+            match client.goto("textDocument/definition", &main_rs, source, call_offset) {
+                Ok(result) => locations = result,
+                // 起動時のインデックス更新中は、この要求だけが失効することがある。
+                Err(error)
+                    if serde_json::from_str::<Value>(&error)
+                        .ok()
+                        .and_then(|error| error.get("code").and_then(Value::as_i64))
+                        == Some(-32801) => {}
+                Err(error) => panic!("definition: {error}"),
+            }
             if !locations.is_empty() {
                 break;
             }
