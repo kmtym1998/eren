@@ -11,10 +11,20 @@ use gpui_kit::component::{Disableable, Icon, Sizable, StyledExt, Theme, ThemeMod
 use gpui_kit::*;
 
 mod agents;
+mod background_task;
+mod external_document;
+mod project_search;
+use background_task::BackgroundTask;
+use external_document::{ExternalRead, ReadKind};
+#[cfg(test)]
+use project_search::search_column;
+use project_search::{SearchMatch, SearchResults};
 mod diff;
 mod file_io;
 mod git_changes;
+mod git_snapshot;
 use git_changes::ChangedFile;
+use git_snapshot::{DiffSnapshot, GitSnapshot};
 mod links;
 mod lsp;
 mod lsp_epoch;
@@ -76,7 +86,6 @@ struct TreeRow {
     expanded: bool,
 }
 
-const MAX_FILE_BYTES: u64 = 2_000_000;
 /// ツリーに出さないフォルダ。
 const SKIPPED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
 
@@ -150,11 +159,6 @@ fn ensure_children(entries: &mut [TreeEntry], dir: &Path) -> bool {
     false
 }
 
-/// Git 自身に HEAD を解決させる。失敗時は既存の「Git 連携」表示へ戻す。
-fn git_branch(root: &Path) -> Option<String> {
-    git_changes::branch(root).ok()
-}
-
 #[derive(Clone)]
 enum PendingNavigation {
     Jump(PathBuf, Position),
@@ -178,7 +182,7 @@ pub struct Workbench {
     pending_project: Option<PathBuf>,
     pending_close: bool,
     save_conflict: bool,
-    baseline: Vec<u8>,
+    baseline: std::sync::Arc<[u8]>,
     file_error: Option<String>,
     status_message: Option<String>,
     _editor_subscription: Subscription,
@@ -225,7 +229,11 @@ pub struct Workbench {
     last_lsp_sync: std::cell::Cell<Option<(u64, u64, bool)>>,
     /// 開いているファイルのディスク上の状態（パス・更新時刻・内容ハッシュ）。
     /// 外部変更の検知に使う。
-    disk_state: Option<(PathBuf, std::time::SystemTime, u64)>,
+    disk_observed: Option<Result<u64, String>>,
+    external_task: BackgroundTask<ExternalRead>,
+    search_task: BackgroundTask<SearchResults>,
+    git_task: BackgroundTask<GitSnapshot>,
+    diff_task: BackgroundTask<DiffSnapshot>,
     /// ジャンプ候補（複数ヒット時）とジャンプ元の位置。
     goto_candidates: Option<(Vec<GotoCandidate>, (PathBuf, Position))>,
     /// シンボル一覧パネル（documentSymbol の結果）。
@@ -438,15 +446,6 @@ fn state_file_path() -> Option<PathBuf> {
     )
 }
 
-/// ファイルの更新時刻と内容ハッシュ（外部変更の検知用）。
-fn read_disk_state(path: &Path) -> Option<(std::time::SystemTime, u64)> {
-    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-    let bytes = std::fs::read(path).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hasher::write(&mut hasher, &bytes);
-    Some((mtime, std::hash::Hasher::finish(&hasher)))
-}
-
 /// PATH から実行ファイルを探す。
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
@@ -454,29 +453,6 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         let candidate = dir.join(name);
         candidate.exists().then_some(candidate)
     })
-}
-
-/// 小文字化した検索位置を、エディタが使う元の行の文字単位の列へ戻す。
-fn search_column(line: &str, lowercase_needle: &str) -> Option<u32> {
-    let byte_index = line.to_lowercase().find(lowercase_needle)?;
-    let mut lowercase_start = 0;
-    for (column, ch) in line.chars().enumerate() {
-        let lowercase_len: usize = ch.to_lowercase().map(char::len_utf8).sum();
-        if byte_index < lowercase_start + lowercase_len {
-            return Some(column as u32);
-        }
-        lowercase_start += lowercase_len;
-    }
-    Some(line.chars().count() as u32)
-}
-
-/// 横断検索のヒット1件。
-pub struct SearchMatch {
-    path: PathBuf,
-    rel: String,
-    line: u32,
-    col: u32,
-    text: String,
 }
 
 impl ChangedFile {
@@ -592,7 +568,10 @@ impl Workbench {
                 let check_disk = ticks.is_multiple_of(25);
                 let keep = this
                     .update_in(cx, |this, window, cx| {
-                        let mut changed = this.refresh_diagnostics(cx);
+                        let mut changed = this.poll_background_io(window, cx);
+                        if this.refresh_diagnostics(cx) {
+                            changed = true;
+                        }
                         if this.refresh_progress(cx) {
                             changed = true;
                         }
@@ -637,7 +616,7 @@ impl Workbench {
             pending_project: None,
             pending_close: false,
             save_conflict: false,
-            baseline: Vec::new(),
+            baseline: std::sync::Arc::from([]),
             file_error: None,
             status_message: None,
             _editor_subscription: subscription,
@@ -668,7 +647,11 @@ impl Workbench {
             lsp_server: None,
             lsp_epoch,
             last_lsp_sync: std::cell::Cell::new(None),
-            disk_state: None,
+            disk_observed: None,
+            external_task: BackgroundTask::default(),
+            search_task: BackgroundTask::default(),
+            git_task: BackgroundTask::default(),
+            diff_task: BackgroundTask::default(),
             goto_candidates: None,
             symbol_entries: None,
             nav_back: Vec::new(),
@@ -685,7 +668,11 @@ impl Workbench {
         self.pending_project = None;
         self.pending_close = false;
         self.save_conflict = false;
-        self.baseline.clear();
+        self.baseline = std::sync::Arc::from([]);
+        self.search_task.invalidate();
+        self.external_task.invalidate();
+        self.git_task.invalidate();
+        self.diff_task.invalidate();
         // 起動スレッドの確認と書き込みに対して、世代更新とスロット消去を一体化する。
         let project_generation = {
             let mut epoch = self.lsp_epoch.lock().unwrap();
@@ -698,7 +685,7 @@ impl Workbench {
             project
         };
         self.tree = read_dir_entries(&root);
-        self.branch = git_branch(&root);
+        self.branch = None;
         self.expanded.clear();
         self.editing_path = None;
         self.dirty = false;
@@ -715,7 +702,7 @@ impl Workbench {
         self.search_truncated = false;
         self.pending_position = None;
         self.pending_navigation = None;
-        self.disk_state = None;
+        self.disk_observed = None;
         *self.hover_doc.lock().unwrap() = None;
         self.diag_entries = Vec::new();
         self.last_diag_version = 0;
@@ -793,7 +780,7 @@ impl Workbench {
                 self.session_error = Some(format!("ターミナルを起動できなかった: {error}"));
             }
         }
-        self.worktree_list = worktrees::list_worktrees(&root).unwrap_or_default();
+        self.worktree_list.clear();
         self.project = Some(root);
         self.refresh_changes();
         self.save_state();
@@ -895,36 +882,29 @@ impl Workbench {
         cx.notify();
     }
 
-    /// git status を読み直して変更一覧を更新する。
+    /// Git 取得は実行待ちを最新要求にまとめ、UI では結果だけ反映する。
     fn refresh_changes(&mut self) {
-        let Some(root) = self.project.clone() else {
+        let Some(project) = self.project.clone() else {
             return;
         };
-        match git_changes::status(&root) {
-            Ok(files) => {
-                self.changes_error = None;
-                self.changes = files;
-            }
-            Err(error) => {
-                self.changes.clear();
-                self.changes_error = Some(error);
-            }
-        }
+        self.git_task
+            .submit(move |cancel| GitSnapshot::read(project, cancel));
     }
 
-    /// 変更ファイルの diff を開く（プロジェクトと Git ルートは区別する）。
     fn open_diff(&mut self, file: &ChangedFile, cx: &mut Context<Self>) {
-        let Some(project) = &self.project else {
+        let Some(project) = self.project.clone() else {
             return;
         };
-        self.diff_text = Some(match git_changes::diff(project, file) {
-            Ok(text) if text.is_empty() => "差分はない（内容が HEAD と同じ）。".into(),
-            Ok(text) => text,
-            Err(error) => error,
-        });
         self.invalidate_lsp_results();
         self.diff_target = Some(file.path.clone());
+        self.diff_text = Some("差分を読み込み中".into());
         self.editor_open = true;
+        let file = file.clone();
+        self.diff_task.submit(move |_| DiffSnapshot {
+            result: git_changes::diff(&project, &file),
+            project,
+            path: file.path,
+        });
         cx.notify();
     }
 
@@ -999,7 +979,7 @@ impl Workbench {
         };
         self.invalidate_lsp_results();
         *self.hover_doc.lock().unwrap() = None;
-        self.baseline = text.as_bytes().to_vec();
+        self.baseline = std::sync::Arc::from(text.as_bytes());
         self.save_conflict = false;
 
         self.file_error = None;
@@ -1021,7 +1001,7 @@ impl Workbench {
         });
         // 診断表示は新しいファイル用に取り直す。
         self.last_diag_version = u64::MAX;
-        self.disk_state = read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
+        self.disk_observed = None;
         self.editing_path = Some(path);
         self.sync_lsp_document(cx);
         self.dirty = false;
@@ -1074,10 +1054,10 @@ impl Workbench {
         match file_io::atomic_save(path, text.as_bytes()) {
             Ok(()) => {
                 self.dirty = false;
-                self.baseline = text.into_bytes();
+                self.baseline = std::sync::Arc::from(text.into_bytes());
+                self.external_task.invalidate();
                 self.save_conflict = false;
-                self.disk_state =
-                    read_disk_state(path).map(|(mtime, hash)| (path.to_path_buf(), mtime, hash));
+                self.disk_observed = None;
                 self.status_message = Some("保存した".into());
                 self.refresh_changes();
                 cx.notify();
@@ -1095,77 +1075,173 @@ impl Workbench {
         self.save_current(cx);
     }
 
-    /// 開いているファイルが外部で変更されていたら追随する（約1秒ごとに呼ばれる）。
-    /// 未保存の変更がなければ自動で読み直し、あれば上書きせず警告だけ出す。
-    /// 画面に影響する変更をしたら true。
-    fn check_external_change(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(path) = self.editing_path.clone() else {
-            return false;
-        };
-        if self.diff_target.is_some() {
-            return false;
+    /// ポーリングは仕事を登録するだけ。前の読み込みが終わるまで重複実行しない。
+    fn check_external_change(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        if !self.external_task.is_running() && self.diff_target.is_none() {
+            self.request_external_read(ReadKind::Check);
         }
-        let Some((stamp_path, mtime, hash)) = self.disk_state.clone() else {
-            return false;
-        };
-        if stamp_path != path {
-            return false;
-        }
-        match read_disk_state(&path) {
-            None => {
-                // 削除された。繰り返し知らせないよう記録を消して一度だけ伝える。
-                self.disk_state = None;
-                self.status_message = Some("開いているファイルが外部で削除された".into());
-                true
-            }
-            Some((now_mtime, now_hash)) => {
-                if now_mtime == mtime && now_hash == hash {
-                    return false;
-                }
-                if self.dirty {
-                    // 同じ変更で繰り返し知らせないよう、新しい状態を記録しておく。
-                    self.disk_state = Some((path, now_mtime, now_hash));
-                    self.status_message = Some(
-                        "ファイルが外部で変更された（未保存の変更があるため読み直していない）"
-                            .into(),
-                    );
-                    true
-                } else {
-                    self.reload_current_file(window, cx);
-                    true
-                }
-            }
-        }
+        false
     }
 
-    /// 現在のファイルをディスクから読み直す（カーソル位置は可能な範囲で保つ）。
-    fn reload_current_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn request_external_read(&mut self, kind: ReadKind) {
         let Some(path) = self.editing_path.clone() else {
             return;
         };
-        let text = match file_io::read_document(&path) {
-            Ok(text) => text,
+        let document = self.lsp_epoch.lock().unwrap().document_stamp();
+        let baseline = self.baseline.clone();
+        self.external_task
+            .submit(move |_| ExternalRead::read(path, document, kind, baseline));
+    }
+
+    fn reload_current_file(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.request_external_read(ReadKind::Reload);
+    }
+
+    fn apply_external_read(
+        &mut self,
+        read: ExternalRead,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_path.as_ref() != Some(&read.path)
+            || self.lsp_epoch.lock().unwrap().document_stamp() != read.document
+        {
+            return;
+        }
+        let observed = read
+            .result
+            .as_ref()
+            .map(|value| value.hash)
+            .map_err(Clone::clone);
+        if matches!(read.kind, ReadKind::Check) && self.disk_observed.as_ref() == Some(&observed) {
+            return;
+        }
+        self.disk_observed = Some(observed);
+        let contents = match read.result {
+            Ok(contents) => contents,
             Err(error) => {
-                self.status_message = Some(format!("再読み込みできなかった: {error}"));
+                self.status_message = Some(error);
                 cx.notify();
                 return;
             }
         };
-        self.baseline = text.as_bytes().to_vec();
+        if matches!(read.kind, ReadKind::Check) {
+            if !contents.changed {
+                return;
+            }
+            if self.dirty {
+                self.status_message = Some(
+                    "ファイルが外部で変更された（未保存の変更があるため読み直していない）".into(),
+                );
+                cx.notify();
+                return;
+            }
+        }
+        self.baseline = std::sync::Arc::from(contents.text.as_bytes());
         self.save_conflict = false;
         let cursor = self.editor.read(cx).cursor_position();
         self.editor.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
+            state.set_value(contents.text, window, cx);
             state.set_cursor_position(cursor, window, cx);
         });
-        // set_value は Change を発火しないので、同期世代を明示的に更新する。
         self.invalidate_lsp_results();
         self.sync_lsp_document(cx);
         self.dirty = false;
-        self.disk_state = read_disk_state(&path).map(|(mtime, hash)| (path.clone(), mtime, hash));
         self.last_diag_version = u64::MAX;
-        self.status_message = Some("外部で変更されたため読み直した".into());
+        self.status_message = Some("外部の内容を読み直した".into());
+        if matches!(read.kind, ReadKind::Reload) {
+            self.continue_pending(window, cx);
+        }
         cx.notify();
+    }
+
+    fn poll_background_io(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        if let Some(result) = self.search_task.poll() {
+            match result {
+                Ok(result) => {
+                    self.search_results = result.matches;
+                    self.search_truncated = result.truncated;
+                    self.status_message = Some(format!(
+                        "検索 {} 件（読み込み対象外・失敗 {} 件）",
+                        self.search_results.len(),
+                        result.skipped
+                    ));
+                }
+                Err(error) => self.status_message = Some(error.into()),
+            }
+            changed = true;
+        }
+        if let Some(result) = self.git_task.poll() {
+            match result {
+                Ok(snapshot) if self.project.as_ref() == Some(&snapshot.project) => {
+                    match snapshot.changes {
+                        Ok(changes) => {
+                            self.changes = changes;
+                            self.changes_error = None;
+                        }
+                        Err(error) => {
+                            self.changes.clear();
+                            self.changes_error = Some(error);
+                        }
+                    }
+                    match snapshot.worktrees {
+                        Ok(worktrees) => self.worktree_list = worktrees,
+                        Err(error) => {
+                            self.worktree_list.clear();
+                            self.status_message = Some(error);
+                        }
+                    }
+                    self.branch = snapshot.branch;
+                }
+                Ok(_) => {}
+                Err(error) => self.changes_error = Some(error.into()),
+            }
+            changed = true;
+        }
+        if let Some(result) = self.diff_task.poll() {
+            match result {
+                Ok(snapshot)
+                    if self.project.as_ref() == Some(&snapshot.project)
+                        && self.diff_target.as_ref() == Some(&snapshot.path) =>
+                {
+                    self.diff_text = Some(match snapshot.result {
+                        Ok(text) if text.is_empty() => "差分はない（内容が HEAD と同じ）。".into(),
+                        Ok(text) => text,
+                        Err(error) => error,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if self.diff_target.is_some() => self.diff_text = Some(error.into()),
+                Err(_) => {}
+            }
+            changed = true;
+        }
+        if let Some(result) = self.external_task.poll() {
+            match result {
+                Ok(read) => self.apply_external_read(read, window, cx),
+                Err(error) => self.status_message = Some(error.into()),
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    fn finish_background_io(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while self.external_task.is_running()
+            || self.search_task.is_running()
+            || self.git_task.is_running()
+            || self.diff_task.is_running()
+        {
+            self.poll_background_io(window, cx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background I/O did not finish"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// 確認バーで「保存して開く」が選ばれたとき。保存に成功したら待機中のファイルを開く。
@@ -1182,6 +1258,7 @@ impl Workbench {
     }
 
     fn cancel_pending(&mut self) {
+        self.external_task.invalidate();
         self.pending_path = None;
         self.pending_position = None;
         self.pending_navigation = None;
@@ -1234,64 +1311,20 @@ impl Workbench {
         false
     }
 
-    /// プロジェクト内を横断検索する（部分一致、大文字小文字を区別しない）。
+    /// Enter では最新版の要求を登録し、走査はワーカーで実行する。
     fn run_search(&mut self, query: &str, cx: &mut Context<Self>) {
-        let query = query.trim().to_string();
-        self.search_query = query.clone();
-        self.search_results = Vec::new();
+        self.search_task.invalidate();
+        self.search_query = query.trim().to_string();
+        self.search_results.clear();
         self.search_truncated = false;
-        if query.is_empty() {
-            cx.notify();
-            return;
-        }
-        let Some(root) = self.project.clone() else {
-            cx.notify();
-            return;
-        };
-        let needle = query.to_lowercase();
-        let mut results: Vec<SearchMatch> = Vec::new();
-        let walker = ignore::WalkBuilder::new(&root)
-            .sort_by_file_path(|a, b| a.cmp(b))
-            .build();
-        'outer: for entry in walker.flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let path = entry.path().to_path_buf();
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if meta.len() > MAX_FILE_BYTES {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            if bytes.iter().take(8192).any(|b| *b == 0) {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            for (index, line) in text.lines().enumerate() {
-                if let Some(col) = search_column(line, &needle) {
-                    results.push(SearchMatch {
-                        rel: path
-                            .strip_prefix(&root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .into_owned(),
-                        path: path.clone(),
-                        line: index as u32,
-                        col,
-                        text: line.trim().chars().take(140).collect(),
-                    });
-                    if results.len() >= 300 {
-                        self.search_truncated = true;
-                        break 'outer;
-                    }
-                }
+        if !self.search_query.is_empty() {
+            if let Some(root) = self.project.clone() {
+                let query = self.search_query.clone();
+                self.search_task
+                    .submit(move |cancel| project_search::search(&root, &query, cancel));
+                self.status_message = Some("検索中".into());
             }
         }
-        self.search_results = results;
         cx.notify();
     }
 
@@ -1306,6 +1339,8 @@ impl Workbench {
 
     fn invalidate_lsp_results(&mut self) {
         self.lsp_epoch.lock().unwrap().next_document();
+        self.external_task.invalidate();
+        self.diff_task.invalidate();
         self.goto_candidates = None;
         self.symbol_entries = None;
     }
@@ -2461,9 +2496,6 @@ impl Workbench {
                                     .label("再読み込み")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.reload_current_file(window, cx);
-                                        if !this.dirty {
-                                            this.continue_pending(window, cx);
-                                        }
                                     })),
                             )
                             .child(
@@ -4601,6 +4633,7 @@ mod editor_safety_tests {
                 // Invalid external data must never replace the editable document.
                 std::fs::write(&path, [255]).unwrap();
                 this.reload_current_file(window, cx);
+                this.finish_background_io(window, cx);
                 assert!(this.dirty);
                 assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
                 assert!(this.write_current(&path, "unsaved".into(), cx));
@@ -4617,6 +4650,7 @@ mod editor_safety_tests {
                 assert!(this.dirty);
                 std::fs::write(&path, "reload 日本語😀\r\n").unwrap();
                 this.reload_current_file(window, cx);
+                this.finish_background_io(window, cx);
                 assert!(!this.dirty);
                 assert_eq!(
                     this.editor.read(cx).text().to_string(),
@@ -4689,6 +4723,7 @@ mod lsp_document_ui_tests {
                 let token = this.lsp_epoch.lock().unwrap().request(RequestKind::Goto);
                 std::fs::write(&path, "fn updated() {}\n").unwrap();
                 this.reload_current_file(window, cx);
+                this.finish_background_io(window, cx);
                 assert!(!this
                     .lsp_epoch
                     .lock()
@@ -4733,6 +4768,412 @@ mod lsp_document_ui_tests {
             "fn updated() {}\n"
         );
         lsp::tests::stop_mock(&client);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod background_io_ui_tests {
+    use super::{external_document::ExternalRead, ReadKind, SearchMatch, SearchResults, Workbench};
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+    use std::{sync::mpsc, time::Duration};
+
+    #[gpui_kit::test]
+    fn slow_search_coalesces_requests_and_keeps_editor_interactive(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-async-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..350 {
+            std::fs::write(dir.join(format!("{index:04}.txt")), "İlatest\n").unwrap();
+        }
+        let a = dir.join("edit.txt");
+        std::fs::write(&a, "original").unwrap();
+        std::fs::write(dir.join("000-invalid.txt"), b"latest\xff").unwrap();
+        std::fs::File::create(dir.join("000-oversized.txt"))
+            .unwrap()
+            .set_len(super::file_io::MAX_DOCUMENT_BYTES * 2)
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.state_path = Some(dir.join("layout.json"));
+                this.open_path(a.clone(), window, cx);
+                this.project = Some(dir.clone());
+                let (release, gate) = mpsc::channel();
+                let (started, ready) = mpsc::channel();
+                let old_path = a.clone();
+                this.search_task.submit(move |_| {
+                    started.send(()).unwrap();
+                    gate.recv().unwrap();
+                    SearchResults {
+                        matches: vec![SearchMatch {
+                            path: old_path,
+                            rel: "old".into(),
+                            line: 0,
+                            col: 0,
+                            text: "obsolete".into(),
+                        }],
+                        ..Default::default()
+                    }
+                });
+                ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                this.run_search("missing", cx);
+                this.run_search("latest", cx);
+                assert!(!this.poll_background_io(window, cx)); // worker is still held by gate.
+                this.editor.update(cx, |state, cx| {
+                    state.set_value("typing continues", window, cx)
+                });
+                this.dirty = true;
+                this.sync_lsp_change(cx);
+                assert_eq!(this.editor.read(cx).text().to_string(), "typing continues");
+                release.send(()).unwrap();
+                this.finish_background_io(window, cx);
+                assert_eq!(this.search_results.len(), 300);
+                assert!(this.search_truncated);
+                assert!(this
+                    .search_results
+                    .iter()
+                    .all(|hit| hit.text.contains("latest") && hit.col == 1));
+                assert_eq!(this.editor.read(cx).text().to_string(), "typing continues");
+                assert!(this.status_message.as_ref().unwrap().contains("失敗 2 件"));
+                this.run_search("", cx);
+                assert!(this.search_results.is_empty());
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn late_external_reads_cannot_replace_edits_saves_or_cancelled_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-async-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "original").unwrap();
+        std::fs::write(&b, "file b").unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                for action in ["edit", "save", "cancel", "switch"] {
+                    this.open_path(a.clone(), window, cx);
+                    std::fs::write(&a, "external").unwrap();
+                    let kind = if action == "cancel" {
+                        ReadKind::Reload
+                    } else {
+                        ReadKind::Check
+                    };
+                    let read = ExternalRead::read(
+                        a.clone(),
+                        this.lsp_epoch.lock().unwrap().document_stamp(),
+                        kind,
+                        this.baseline.clone(),
+                    );
+                    let (release, gate) = mpsc::channel();
+                    let (started, ready) = mpsc::channel();
+                    this.external_task.submit(move |_| {
+                        started.send(()).unwrap();
+                        gate.recv().unwrap();
+                        read
+                    });
+                    ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                    // Repeated poll ticks must neither replace nor duplicate the in-flight read.
+                    for _ in 0..3 {
+                        assert!(!this.check_external_change(window, cx));
+                    }
+                    assert!(!this.poll_background_io(window, cx));
+                    this.editor
+                        .update(cx, |state, cx| state.set_value("unsaved edit", window, cx));
+                    this.dirty = true;
+                    match action {
+                        "edit" => this.sync_lsp_change(cx),
+                        "save" => {
+                            assert!(this.write_current(&a, "saved edit".into(), cx));
+                        }
+                        "cancel" => {
+                            this.pending_path = Some(b.clone());
+                            this.cancel_pending();
+                        }
+                        "switch" => {
+                            this.open_path(b.clone(), window, cx);
+                        }
+                        _ => unreachable!(),
+                    }
+                    release.send(()).unwrap();
+                    this.finish_background_io(window, cx);
+                    assert_eq!(
+                        this.editor.read(cx).text().to_string(),
+                        if action == "switch" {
+                            "file b"
+                        } else {
+                            "unsaved edit"
+                        }
+                    );
+                    assert_eq!(
+                        this.editing_path.as_ref(),
+                        Some(if action == "switch" { &b } else { &a })
+                    );
+                    assert!(this.pending_path.is_none());
+                }
+                // A file that grows beyond the limit or stops being valid text never replaces the editor.
+                for bytes in [None, Some(vec![255]), Some(vec![0; 9000])] {
+                    match bytes {
+                        None => std::fs::File::create(&a)
+                            .unwrap()
+                            .set_len(super::file_io::MAX_DOCUMENT_BYTES * 2)
+                            .unwrap(),
+                        Some(bytes) => std::fs::write(&a, bytes).unwrap(),
+                    }
+                    this.open_path(b.clone(), window, cx);
+                    this.editing_path = Some(a.clone()); // observed path without reading invalid data.
+                    this.request_external_read(ReadKind::Reload);
+                    this.finish_background_io(window, cx);
+                    assert_eq!(this.editor.read(cx).text().to_string(), "file b");
+                    assert!(this
+                        .status_message
+                        .as_ref()
+                        .unwrap()
+                        .contains("再読み込みできなかった"));
+                }
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod slow_git_ui_tests {
+    use super::{ChangedFile, DiffSnapshot, Workbench};
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        process::Command,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn slow_git_hook_keeps_ui_interactive_and_old_project_snapshot_is_discarded(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-slow-git-{}", std::process::id()));
+        let a = dir.join("a");
+        let b = dir.join("b");
+        for root in [&a, &b] {
+            std::fs::create_dir_all(root).unwrap();
+            git(root, &["init", "-q"]);
+        }
+        std::fs::write(a.join("a.txt"), "file a").unwrap();
+        std::fs::write(b.join("b.txt"), "file b").unwrap();
+        let hook = a.join(".git/slow-fsmonitor");
+        let started = a.join(".git/started");
+        let release = a.join(".git/release");
+        std::fs::write(&hook, format!("#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys,time\nPath({:?}).touch()\nend=time.monotonic()+10\nwhile not Path({:?}).exists() and time.monotonic()<end: time.sleep(0.005)\nsys.stdout.buffer.write(b'token\\0/\\0')\n", started, release)).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&a, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        cx.update_window(handle, |_, _, cx| {
+            entity.update(cx, |this, _| {
+                this.project = Some(a.clone());
+                this.state_path = Some(dir.join("state.json"));
+                this.refresh_changes();
+            })
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "slow Git hook did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                assert!(!this.poll_background_io(window, cx));
+                this.open_path(a.join("a.txt"), window, cx);
+                this.editor.update(cx, |state, cx| {
+                    state.set_value("typing during git", window, cx)
+                });
+                this.dirty = true;
+                this.request_project(b.clone(), cx);
+                assert_eq!(this.editor.read(cx).text().to_string(), "typing during git");
+                assert_eq!(this.pending_project.as_ref(), Some(&b));
+                this.discard_and_open_pending(window, cx);
+                assert_eq!(this.project.as_ref(), Some(&b));
+                std::fs::write(&release, "release").unwrap();
+                this.finish_background_io(window, cx);
+                assert_eq!(this.changes.len(), 1);
+                assert_eq!(this.changes[0].path, "b.txt");
+                assert_eq!(
+                    this.worktree_list[0].path,
+                    std::fs::canonicalize(&b).unwrap()
+                );
+                assert!(this.changes_error.is_none());
+                for tab in this.sessions.drain(..) {
+                    tab.session.shutdown();
+                }
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn delayed_diff_cannot_reopen_closed_view_and_failed_diff_remains_visible(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-late-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.project = Some(dir.clone());
+                this.diff_target = Some("old".into());
+                this.diff_text = Some("loading".into());
+                let (release, gate) = mpsc::channel();
+                let (started, ready) = mpsc::channel();
+                let project = dir.clone();
+                this.diff_task.submit(move |_| {
+                    started.send(()).unwrap();
+                    gate.recv().unwrap();
+                    DiffSnapshot {
+                        project,
+                        path: "old".into(),
+                        result: Ok("obsolete".into()),
+                    }
+                });
+                ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert!(!this.poll_background_io(window, cx));
+                this.show_current_editor(cx);
+                release.send(()).unwrap();
+                this.finish_background_io(window, cx);
+                assert!(this.diff_target.is_none());
+                assert!(this.diff_text.is_none());
+                this.open_diff(
+                    &ChangedFile {
+                        path: "missing".into(),
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                this.finish_background_io(window, cx);
+                assert_eq!(this.diff_target.as_deref(), Some("missing"));
+                assert!(this.diff_text.as_ref().unwrap().contains("失敗"));
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod external_reload_ui_tests {
+    use super::{ReadKind, Workbench};
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn automatic_reload_keeps_edits_and_explicit_reload_continues_only_after_success(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-reload-flow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "initial").unwrap();
+        std::fs::write(&b, "file b").unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.open_path(a.clone(), window, cx);
+                std::fs::write(&a, "clean update").unwrap();
+                this.check_external_change(window, cx);
+                assert_eq!(this.editor.read(cx).text().to_string(), "initial");
+                this.finish_background_io(window, cx);
+                assert_eq!(this.editor.read(cx).text().to_string(), "clean update");
+                assert!(!this.dirty);
+                this.editor
+                    .update(cx, |state, cx| state.set_value("unsaved", window, cx));
+                this.dirty = true;
+                this.sync_lsp_change(cx);
+                std::fs::write(&a, "external update").unwrap();
+                this.request_external_read(ReadKind::Check);
+                this.finish_background_io(window, cx);
+                assert_eq!(this.editor.read(cx).text().to_string(), "unsaved");
+                assert!(this.dirty);
+                assert!(this
+                    .status_message
+                    .as_ref()
+                    .unwrap()
+                    .contains("未保存の変更"));
+                this.pending_path = Some(b.clone());
+                this.save_conflict = true;
+                std::fs::write(&a, [255]).unwrap();
+                this.reload_current_file(window, cx);
+                this.finish_background_io(window, cx);
+                assert!(this.dirty);
+                assert_eq!(this.editing_path.as_ref(), Some(&a));
+                assert_eq!(this.pending_path.as_ref(), Some(&b));
+                std::fs::write(&a, "valid again").unwrap();
+                this.reload_current_file(window, cx);
+                assert_eq!(this.editing_path.as_ref(), Some(&a));
+                this.finish_background_io(window, cx);
+                assert_eq!(this.editing_path.as_ref(), Some(&b));
+                assert_eq!(this.editor.read(cx).text().to_string(), "file b");
+                assert!(!this.dirty);
+                assert!(this.pending_path.is_none());
+                std::fs::remove_file(&b).unwrap();
+                this.check_external_change(window, cx);
+                this.finish_background_io(window, cx);
+                assert_eq!(this.editor.read(cx).text().to_string(), "file b");
+                assert!(this.status_message.as_ref().unwrap().contains("外部で削除"));
+            })
+        })
+        .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

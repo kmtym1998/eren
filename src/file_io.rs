@@ -3,12 +3,21 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub const MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;
+
 pub fn read_document(path: &Path) -> io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "通常ファイルではないか 2 MB を超えている",
+        ));
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
-        .take(2 * 1024 * 1024 + 1)
+        .take(MAX_DOCUMENT_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > 2 * 1024 * 1024 || bytes.contains(&0) {
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES || bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "2 MB 超またはバイナリのファイルは開けない",
@@ -19,8 +28,16 @@ pub fn read_document(path: &Path) -> io::Result<String> {
 }
 
 pub fn conflicts(path: &Path, baseline: &[u8]) -> io::Result<bool> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(bytes != baseline),
+    match std::fs::File::open(path) {
+        Ok(file) => {
+            // 外部で巨大化しても、保存前の比較で上限なしに読み込まない。
+            if file.metadata()?.len() > MAX_DOCUMENT_BYTES {
+                return Ok(true);
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_DOCUMENT_BYTES + 1).read_to_end(&mut bytes)?;
+            Ok(bytes != baseline)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
     }
