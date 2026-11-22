@@ -1330,6 +1330,7 @@ impl Workbench {
 
     /// diff や非表示から、保持している文書の編集へ戻る。
     fn show_current_editor(&mut self, cx: &App) {
+        self.diff_task.invalidate();
         self.invalidate_lsp_results();
         self.diff_target = None;
         self.diff_text = None;
@@ -1340,7 +1341,6 @@ impl Workbench {
     fn invalidate_lsp_results(&mut self) {
         self.lsp_epoch.lock().unwrap().next_document();
         self.external_task.invalidate();
-        self.diff_task.invalidate();
         self.goto_candidates = None;
         self.symbol_entries = None;
     }
@@ -5171,6 +5171,65 @@ mod external_reload_ui_tests {
                 this.finish_background_io(window, cx);
                 assert_eq!(this.editor.read(cx).text().to_string(), "file b");
                 assert!(this.status_message.as_ref().unwrap().contains("外部で削除"));
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod diff_toggle_ui_tests {
+    use super::{DiffSnapshot, Workbench};
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+    use std::{sync::mpsc, time::Duration};
+
+    #[gpui_kit::test]
+    fn toggling_editor_keeps_pending_diff_for_same_target(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx))
+            })
+            .unwrap()
+        });
+        let dir = std::env::temp_dir().join(format!("eren-diff-toggle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.project = Some(dir.clone());
+                this.state_path = Some(dir.join("state.json"));
+                for complete_while_hidden in [false, true] {
+                    this.editor_open = true;
+                    this.diff_target = Some("kept".into());
+                    this.diff_text = Some("loading".into());
+                    let (release, gate) = mpsc::channel();
+                    let (started, ready) = mpsc::channel();
+                    let project = dir.clone();
+                    this.diff_task.submit(move |_| {
+                        started.send(()).unwrap();
+                        gate.recv().unwrap();
+                        DiffSnapshot {
+                            project,
+                            path: "kept".into(),
+                            result: Ok("current diff".into()),
+                        }
+                    });
+                    ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                    this.toggle_editor(window, cx);
+                    assert!(!this.editor_open);
+                    if !complete_while_hidden {
+                        this.toggle_editor(window, cx);
+                    }
+                    release.send(()).unwrap();
+                    this.finish_background_io(window, cx);
+                    if complete_while_hidden {
+                        this.toggle_editor(window, cx);
+                    }
+                    assert!(this.editor_open);
+                    assert_eq!(this.diff_target.as_deref(), Some("kept"));
+                    assert_eq!(this.diff_text.as_deref(), Some("current diff"));
+                }
             })
         })
         .unwrap();
