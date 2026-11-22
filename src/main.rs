@@ -2236,7 +2236,7 @@ impl Workbench {
         if let (Some(target), Some(text)) = (&self.diff_target, &self.diff_text) {
             return self.diff_view(target.clone(), text.clone(), cx);
         }
-        let panel = div().v_flex().flex_1().min_w_0().h_full();
+        let panel = div().v_flex().flex_1().min_w_0().h_full().overflow_hidden();
 
         if let Some(error) = self
             .file_error
@@ -2247,9 +2247,19 @@ impl Workbench {
                 div()
                     .flex_1()
                     .v_flex()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .px_3()
                     .items_center()
                     .justify_center()
-                    .child(div().text_color(rgb(0xe9b4aa)).child(error.clone())),
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_color(rgb(0xe9b4aa))
+                            .child(error.clone()),
+                    ),
             );
         }
 
@@ -2258,10 +2268,16 @@ impl Workbench {
                 div()
                     .flex_1()
                     .v_flex()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .px_3()
                     .items_center()
                     .justify_center()
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
+                            .whitespace_normal()
                             .text_color(rgb(MUTED))
                             .child("左のツリーでファイルを選ぶと、ここで編集できる"),
                     ),
@@ -2282,8 +2298,34 @@ impl Workbench {
                     .flex_shrink_0(),
             );
         }
-        header = header
-            .child(div().flex_1())
+        // 固定高の見出しにはタイトルと閉じる操作だけを置く。
+        header = header.child(div().flex_1()).child(
+            div()
+                .id("close-editor")
+                .flex_shrink_0()
+                .cursor_pointer()
+                .px_1()
+                .text_color(rgb(MUTED))
+                .child(icon(Glyph::X))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.invalidate_lsp_results();
+                    this.editor_open = false;
+                    this.sync_lsp_document(cx);
+                    this.terminal_focus.focus(window, cx);
+                    cx.notify();
+                })),
+        );
+        // 操作列は高さを固定せず、狭いviewerでは必要な行数へ折り返す。
+        let actions = div()
+            .h_flex()
+            .flex_wrap()
+            .min_w_0()
+            .flex_shrink_0()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(LINE))
             .child(
                 Button::new("goto-definition")
                     .ghost()
@@ -2321,31 +2363,16 @@ impl Workbench {
                     .label("保存")
                     .disabled(!self.dirty)
                     .on_click(cx.listener(|this, _, _, cx| this.save_file(cx))),
-            )
-            .child(
-                div()
-                    .id("close-editor")
-                    .cursor_pointer()
-                    .px_1()
-                    .text_color(rgb(MUTED))
-                    .child(icon(Glyph::X))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.invalidate_lsp_results();
-                        this.editor_open = false;
-                        this.sync_lsp_document(cx);
-                        this.terminal_focus.focus(window, cx);
-                        cx.notify();
-                    })),
             );
 
-        let mut panel = panel.child(header);
+        let mut panel = panel.child(header).child(actions);
         if self.pending_path.is_some() || self.pending_project.is_some() || self.pending_close {
             panel = panel.child(
                 div()
-                    .h_flex()
-                    .items_center()
-                    .gap_3()
-                    .px_4()
+                    .v_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .px_3()
                     .py_2()
                     .flex_shrink_0()
                     .bg(rgb(0x3a2e22))
@@ -2354,78 +2381,103 @@ impl Workbench {
                     .text_size(px(12.))
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
+                            .whitespace_normal()
                             .child("未保存の変更があります"),
                     )
                     .child(
-                        Button::new("confirm-save-open")
-                            .primary()
-                            .small()
-                            .label("保存して続行")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_and_open_pending(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("confirm-discard-open")
-                            .ghost()
-                            .small()
-                            .label("破棄して続行")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.discard_and_open_pending(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("confirm-cancel")
-                            .ghost()
-                            .small()
-                            .label("キャンセル")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cancel_pending();
-                                cx.notify();
-                            })),
+                        div()
+                            .h_flex()
+                            .flex_wrap()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                Button::new("confirm-save-open")
+                                    .primary()
+                                    .small()
+                                    .label("保存して続行")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_and_open_pending(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-discard-open")
+                                    .ghost()
+                                    .small()
+                                    .label("破棄して続行")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.discard_and_open_pending(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-cancel")
+                                    .ghost()
+                                    .small()
+                                    .label("キャンセル")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_pending();
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             );
         }
         if self.save_conflict {
-            panel =
-                panel.child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .px_4()
-                        .py_2()
-                        .child("外部変更と競合")
-                        .child(Button::new("overwrite-conflict").label("上書き").on_click(
-                            cx.listener(|this, _, window, cx| {
-                                let Some(path) = this.editing_path.clone() else {
-                                    return;
-                                };
-                                let text = this.editor.read(cx).text().to_string();
-                                if this.write_current(&path, text, cx) {
-                                    this.continue_pending(window, cx);
-                                }
-                            }),
-                        ))
-                        .child(Button::new("reload-conflict").label("再読み込み").on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.reload_current_file(window, cx);
-                                if !this.dirty {
-                                    this.continue_pending(window, cx);
-                                }
-                            }),
-                        ))
-                        .child(Button::new("cancel-conflict").label("キャンセル").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.save_conflict = false;
-                                this.cancel_pending();
-                                cx.notify();
-                            }),
-                        )),
-                );
+            panel = panel.child(
+                div()
+                    .v_flex()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(SURFACE))
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(div().min_w_0().whitespace_normal().child("外部変更と競合"))
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_wrap()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                Button::new("overwrite-conflict")
+                                    .small()
+                                    .label("上書き")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let Some(path) = this.editing_path.clone() else {
+                                            return;
+                                        };
+                                        let text = this.editor.read(cx).text().to_string();
+                                        if this.write_current(&path, text, cx) {
+                                            this.continue_pending(window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("reload-conflict")
+                                    .small()
+                                    .label("再読み込み")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reload_current_file(window, cx);
+                                        if !this.dirty {
+                                            this.continue_pending(window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("cancel-conflict")
+                                    .small()
+                                    .label("キャンセル")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_conflict = false;
+                                        this.cancel_pending();
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
         }
         if let Some((candidates, _)) = &self.goto_candidates {
             let mut list = div()
@@ -3224,23 +3276,30 @@ impl Workbench {
                 })
                 .child(
                     div()
-                        .h(px(44.))
+                        .min_h(px(44.))
+                        .flex_shrink_0()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .px_3()
+                        .py_2()
                         .h_flex()
                         .items_center()
                         .justify_center()
                         .gap_2()
                         .text_size(px(11.))
                         .text_color(rgb(MUTED))
-                        .child(icon(Glyph::PencilLine))
-                        .child(if let Some(message) = &self.status_message {
-                            message.clone()
-                        } else if self.dirty {
-                            "未保存の変更がある（Cmd+S で保存）".to_string()
-                        } else if self.editing_path.is_some() {
-                            "保存済み".to_string()
-                        } else {
-                            "ファイルを選んで編集を始める".to_string()
-                        }),
+                        .child(div().flex_shrink_0().child(icon(Glyph::PencilLine)))
+                        .child(div().min_w_0().flex_1().whitespace_normal().child(
+                            if let Some(message) = &self.status_message {
+                                message.clone()
+                            } else if self.dirty {
+                                "未保存の変更がある（Cmd+S で保存）".to_string()
+                            } else if self.editing_path.is_some() {
+                                "保存済み".to_string()
+                            } else {
+                                "ファイルを選んで編集を始める".to_string()
+                            },
+                        )),
                 );
         }
         let title = "ここから、作業を始めよう";
