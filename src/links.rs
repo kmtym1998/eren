@@ -17,6 +17,64 @@ pub struct LinkSpan {
     pub target: LinkTarget,
 }
 
+fn wrapper(ch: char) -> bool {
+    matches!(
+        ch,
+        '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+    )
+}
+
+/// Keep raw byte ranges while decoding only quoting and escaped separators.
+fn path_tokens(line: &str) -> Vec<(usize, usize, String)> {
+    let mut tokens = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    while let Some((start, first)) = chars.peek().copied() {
+        if first.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut decoded = String::new();
+        let mut quote = None;
+        let mut leading_wrappers = true;
+        let mut end = start;
+        while let Some((offset, ch)) = chars.peek().copied() {
+            if quote.is_none() && ch.is_whitespace() {
+                break;
+            }
+            chars.next();
+            end = offset + ch.len_utf8();
+            if ch == '\\' && quote != Some('\'') {
+                if let Some((next_offset, next)) = chars.peek().copied() {
+                    if next.is_whitespace() || matches!(next, '\\' | '\'' | '"' | '`') {
+                        chars.next();
+                        end = next_offset + next.len_utf8();
+                        decoded.push(next);
+                        leading_wrappers = false;
+                        continue;
+                    }
+                }
+            }
+            if quote == Some(ch) {
+                quote = None;
+                continue;
+            }
+            if quote.is_none() && leading_wrappers && matches!(ch, '\'' | '"' | '`') {
+                quote = Some(ch);
+                continue;
+            }
+            decoded.push(ch);
+            if !wrapper(ch) {
+                leading_wrappers = false;
+            }
+        }
+        // Do not turn fragments of an unterminated quoted path into separate links.
+        if quote.is_none() {
+            tokens.push((start, end, decoded));
+        }
+    }
+    tokens
+}
+
 /// Finds links using UTF-8 byte offsets. URL spans take precedence over paths.
 pub fn find_links(line: &str) -> Vec<LinkSpan> {
     let mut links = Vec::new();
@@ -32,8 +90,12 @@ pub fn find_links(line: &str) -> Vec<LinkSpan> {
             break;
         };
         let start = cursor + relative;
+        let quote = line[..start]
+            .chars()
+            .next_back()
+            .filter(|ch| matches!(ch, '\'' | '"' | '`'));
         let end = line[start..]
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>'))
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>') || quote == Some(c))
             .map_or(line.len(), |n| start + n);
         let mut trimmed = end;
         while trimmed > start {
@@ -70,25 +132,22 @@ pub fn find_links(line: &str) -> Vec<LinkSpan> {
         cursor = end;
     }
 
-    let mut offset = 0;
-    for token in line.split_whitespace() {
-        let start = offset + line[offset..].find(token).unwrap();
-        offset = start + token.len();
-        if token.contains("://") || token.contains('@') {
+    for (raw_start, raw_end, decoded) in path_tokens(line) {
+        if decoded.contains("://") || decoded.contains('@') {
             continue;
         }
-        let wrapper = |c: char| {
-            matches!(
-                c,
-                '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-            )
-        };
-        let left = token.trim_start_matches(wrapper);
-        let candidate = left.trim_end_matches(|c: char| {
-            wrapper(c) || matches!(c, '.' | ',' | ';' | ':' | '!' | '?')
+        let raw = &line[raw_start..raw_end];
+        let left = raw.trim_start_matches(wrapper);
+        let visible = left.trim_end_matches(|ch: char| {
+            wrapper(ch) || matches!(ch, '.' | ',' | ';' | ':' | '!' | '?')
         });
-        let start = start + token.len() - left.len();
-        let end = start + candidate.len();
+        let start = raw_start + raw.len() - left.len();
+        let end = start + visible.len();
+        let candidate = decoded
+            .trim_start_matches(wrapper)
+            .trim_end_matches(|ch: char| {
+                wrapper(ch) || matches!(ch, '.' | ',' | ';' | ':' | '!' | '?')
+            });
         if candidate.is_empty()
             || links
                 .iter()
@@ -261,6 +320,107 @@ mod tests {
             file(text, "src/a.rs:2", "src/a.rs", Some(2), None);
         }
     }
+    #[test]
+    fn quoted_space_paths_remain_single_links() {
+        for quote in ['\'', '"', '`'] {
+            let text = format!("日本語 🦀 {quote}/tmp/my project/日本 語.rs:12:5{quote}");
+            file(
+                &text,
+                "/tmp/my project/日本 語.rs:12:5",
+                "/tmp/my project/日本 語.rs",
+                Some(12),
+                Some(5),
+            );
+        }
+        file(
+            "'../my project/日本語.rs'",
+            "../my project/日本語.rs",
+            "../my project/日本語.rs",
+            None,
+            None,
+        );
+        file("\"my file.rs\"", "my file.rs", "my file.rs", None, None);
+    }
+
+    #[test]
+    fn suffix_after_closing_quote_and_outer_wrappers() {
+        file(
+            "('../my project/a.rs':12:5)",
+            "../my project/a.rs':12:5",
+            "../my project/a.rs",
+            Some(12),
+            Some(5),
+        );
+        file(
+            "\"/tmp/my project/a.rs\":7",
+            "/tmp/my project/a.rs\":7",
+            "/tmp/my project/a.rs",
+            Some(7),
+            None,
+        );
+    }
+
+    #[test]
+    fn escaped_whitespace_keeps_raw_span_and_decoded_path() {
+        file(
+            r"日本語 /tmp/my\ project/日本\ 語.rs:12:5",
+            r"/tmp/my\ project/日本\ 語.rs:12:5",
+            "/tmp/my project/日本 語.rs",
+            Some(12),
+            Some(5),
+        );
+        file(
+            r"../my\ project/a.rs:7",
+            r"../my\ project/a.rs:7",
+            "../my project/a.rs",
+            Some(7),
+            None,
+        );
+        file(
+            "./my\\	project/a.rs",
+            "./my\\	project/a.rs",
+            "./my	project/a.rs",
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn escaped_quotes_and_literal_apostrophes_are_preserved() {
+        file(
+            r#""/tmp/it\"s file.rs:2""#,
+            r#"/tmp/it\"s file.rs:2"#,
+            "/tmp/it\"s file.rs",
+            Some(2),
+            None,
+        );
+        file("src/it's.rs", "src/it's.rs", "src/it's.rs", None, None);
+        assert!(find_links("'/tmp/my project/a.rs").is_empty());
+    }
+
+    #[test]
+    fn quoted_paths_and_urls_have_sorted_nonoverlapping_byte_spans() {
+        let text = "🦀 '../日本 語/a.rs:4' 'https://example.com/b.rs' ../my\\ project/c.rs:8:2";
+        let links = find_links(text);
+        assert_eq!(links.len(), 3, "{links:?}");
+        assert!(links.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        assert!(
+            matches!(&links[0].target, LinkTarget::FilePath { path, line: Some(4), .. } if path == "../日本 語/a.rs")
+        );
+        assert_eq!(
+            links[1].target,
+            LinkTarget::Url("https://example.com/b.rs".into())
+        );
+        assert!(
+            matches!(&links[2].target, LinkTarget::FilePath { path, line: Some(8), column: Some(2) } if path == "../my project/c.rs")
+        );
+        assert_eq!(&text[links[0].start..links[0].end], "../日本 語/a.rs:4");
+        assert_eq!(
+            &text[links[2].start..links[2].end],
+            "../my\\ project/c.rs:8:2"
+        );
+    }
+
     #[test]
     fn empty_and_punctuation() {
         assert!(find_links("").is_empty());
