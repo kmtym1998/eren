@@ -39,6 +39,27 @@ pub fn repository_root(project: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
+/// HEAD is resolved by Git, including gitdir files and discovery from subfolders.
+/// Detached HEAD is represented explicitly; command failures remain errors.
+pub fn branch(project: &Path) -> Result<String, String> {
+    let symbolic = run(project, &["symbolic-ref", "--short", "--quiet", "HEAD"])?;
+    if symbolic.status.success() {
+        return String::from_utf8(symbolic.stdout)
+            .map(|name| name.trim_end_matches('\n').to_string())
+            .map_err(|_| "Git ブランチ名が UTF-8 ではない".into());
+    }
+    if symbolic.status.code() != Some(1) {
+        return Err(failure("symbolic-ref", &symbolic));
+    }
+    let detached = run(project, &["rev-parse", "--verify", "--short", "HEAD"])?;
+    if !detached.status.success() {
+        return Err(failure("rev-parse HEAD", &detached));
+    }
+    let hash =
+        String::from_utf8(detached.stdout).map_err(|_| "Git HEAD の出力が不正".to_string())?;
+    Ok(format!("detached HEAD ({})", hash.trim_end_matches('\n')))
+}
+
 pub fn parse_porcelain(bytes: &[u8]) -> Result<Vec<ChangedFile>, String> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| "Git status のパスが UTF-8 ではない".to_string())?;
@@ -361,6 +382,44 @@ mod tests {
         let patch = diff(&repo.root, &status(&repo.root).unwrap()[0]).unwrap();
         assert!(patch.contains("rename from"));
         assert!(patch.contains("-line 10\n+edited ten"), "{patch}");
+    }
+
+    #[test]
+    fn branches_are_discovered_from_unborn_subfolder_and_linked_worktrees() {
+        let repo = Repository::new();
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/fixture-unborn"]);
+        std::fs::create_dir(repo.root.join("sub")).unwrap();
+        assert_eq!(branch(&repo.root).unwrap(), "fixture-unborn");
+        assert_eq!(branch(&repo.root.join("sub")).unwrap(), "fixture-unborn");
+        repo.write("sub/file", "fixture\n");
+        repo.commit();
+        repo.git(&["checkout", "-qb", "topic"]);
+        assert_eq!(branch(&repo.root).unwrap(), "topic");
+        assert_eq!(branch(&repo.root.join("sub")).unwrap(), "topic");
+        let linked = repo.directory.join("linked 日本語 space");
+        repo.git(&[
+            "worktree",
+            "add",
+            "-qb",
+            "fixture-linked",
+            linked.to_str().unwrap(),
+        ]);
+        assert!(linked.join(".git").is_file());
+        assert_eq!(branch(&linked).unwrap(), "fixture-linked");
+        assert_eq!(branch(&linked.join("sub")).unwrap(), "fixture-linked");
+        repo.git(&["checkout", "--detach", "HEAD"]);
+        let short = String::from_utf8(repo.git(&["rev-parse", "--short", "HEAD"]).stdout).unwrap();
+        let expected = format!("detached HEAD ({})", short.trim_end());
+        assert_eq!(branch(&repo.root).unwrap(), expected);
+        assert_eq!(branch(&repo.root.join("sub")).unwrap(), expected);
+    }
+
+    #[test]
+    fn branch_command_errors_do_not_become_branch_names() {
+        let repo = Repository::new();
+        assert!(branch(&repo.directory).is_err());
+        std::fs::write(repo.root.join(".git/HEAD"), "invalid HEAD").unwrap();
+        assert!(branch(&repo.root).is_err());
     }
 
     #[test]
