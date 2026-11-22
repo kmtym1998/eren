@@ -6,8 +6,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -40,11 +40,25 @@ const DEFAULT_BG: Rgb = Rgb {
 struct WakeListener {
     wake: Arc<AtomicBool>,
     events: mpsc::Sender<Event>,
+    state: Arc<AtomicI64>,
 }
 
 impl EventListener for WakeListener {
     fn send_event(&self, event: Event) {
         match event {
+            Event::ChildExit(code) => {
+                self.state.store(code as i64, Ordering::SeqCst);
+                self.wake.store(true, Ordering::SeqCst);
+            }
+            Event::Exit => {
+                let _ = self.state.compare_exchange(
+                    RUNNING,
+                    EXIT_UNKNOWN,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                self.wake.store(true, Ordering::SeqCst);
+            }
             Event::Wakeup => self.wake.store(true, Ordering::SeqCst),
             Event::PtyWrite(_) | Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) => {
                 // パーサーは Term のロック中に呼ぶため、ここでは問い合わせを積むだけにする。
@@ -158,10 +172,36 @@ impl Snapshot {
     }
 }
 
+const RUNNING: i64 = i64::MIN;
+const EXIT_UNKNOWN: i64 = i64::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    Running,
+    Exited(Option<i32>),
+}
+
+impl SessionState {
+    pub fn exit_message(self) -> Option<String> {
+        match self {
+            Self::Running => None,
+            Self::Exited(Some(code)) => Some(format!("シェル終了（終了コード: {code}）")),
+            Self::Exited(None) => Some("シェル終了（終了コードなし）".into()),
+        }
+    }
+}
+
+type PtyThread = std::thread::JoinHandle<(
+    EventLoop<tty::Pty, WakeListener>,
+    alacritty_terminal::event_loop::State,
+)>;
+
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct TerminalSession {
     id: u64,
+    state: Arc<AtomicI64>,
+    worker: Mutex<Option<PtyThread>>,
     term: Arc<FairMutex<Term<WakeListener>>>,
     sender: EventLoopSender,
     events: mpsc::Receiver<Event>,
@@ -186,11 +226,30 @@ impl TerminalSession {
     }
 
     fn spawn(cwd: &Path, cols: usize, rows: usize, command: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_in_env(cwd, cols, rows, command, HashMap::new())
+    }
+
+    fn spawn_in_env(
+        cwd: &Path,
+        cols: usize,
+        rows: usize,
+        command: Option<&str>,
+        env: HashMap<String, String>,
+    ) -> std::io::Result<Self> {
+        // alacrittyは無効なcwdからホームへ退避するため、起動前に失敗を明示する。
+        if !std::fs::metadata(cwd)?.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "作業フォルダがディレクトリではない",
+            ));
+        }
         let wake = Arc::new(AtomicBool::new(true));
         let (events_tx, events) = mpsc::channel();
+        let state = Arc::new(AtomicI64::new(RUNNING));
         let listener = WakeListener {
             wake: wake.clone(),
             events: events_tx,
+            state: state.clone(),
         };
         let term = Arc::new(FairMutex::new(Term::new(
             Config::default(),
@@ -210,7 +269,7 @@ impl TerminalSession {
             shell: Some(Shell::new(shell_path, args)),
             working_directory: Some(cwd.to_path_buf()),
             drain_on_exit: false,
-            env: HashMap::new(),
+            env,
         };
         let window_size = WindowSize {
             num_lines: rows as u16,
@@ -219,11 +278,13 @@ impl TerminalSession {
             cell_height: CELL_H as u16,
         };
         let pty = tty::new(&options, window_size, 0)?;
-        let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
+        let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
         let sender = event_loop.channel();
-        let _handle = event_loop.spawn();
+        let worker = event_loop.spawn();
         Ok(Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            state,
+            worker: Mutex::new(Some(worker)),
             term,
             sender,
             events,
@@ -231,6 +292,21 @@ impl TerminalSession {
             cols,
             rows,
         })
+    }
+
+    pub fn state(&self) -> SessionState {
+        match self.state.load(Ordering::SeqCst) {
+            RUNNING => SessionState::Running,
+            EXIT_UNKNOWN => SessionState::Exited(None),
+            code => SessionState::Exited(Some(code as i32)),
+        }
+    }
+
+    fn mark_disconnected(&self) {
+        let _ =
+            self.state
+                .compare_exchange(RUNNING, EXIT_UNKNOWN, Ordering::SeqCst, Ordering::SeqCst);
+        self.wake.store(true, Ordering::SeqCst);
     }
 
     pub fn id(&self) -> u64 {
@@ -260,9 +336,18 @@ impl TerminalSession {
     }
 
     pub fn write(&self, bytes: &[u8]) {
+        if bytes.is_empty() || self.state() != SessionState::Running {
+            return;
+        }
         // 入力時は最下部へ戻す（一般的なターミナルの挙動）。
         self.term.lock().scroll_display(Scroll::Bottom);
-        let _ = self.sender.send(Msg::Input(Cow::Owned(bytes.to_vec())));
+        if self
+            .sender
+            .send(Msg::Input(Cow::Owned(bytes.to_vec())))
+            .is_err()
+        {
+            self.mark_disconnected();
+        }
     }
 
     /// 履歴スクロール。正で過去方向、負で最新方向へ。
@@ -275,6 +360,13 @@ impl TerminalSession {
 
     pub fn shutdown(&self) {
         let _ = self.sender.send(Msg::Shutdown);
+        self.mark_disconnected();
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            // PTYのDropは子を待つため、UIスレッドでjoinしない。
+            std::thread::spawn(move || {
+                let _ = worker.join();
+            });
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -296,6 +388,16 @@ impl TerminalSession {
 
     /// PTY スレッドのパースが終わってから応答を作る。ユーザー入力と違い履歴位置は変えない。
     pub fn process_events(&self) {
+        let mut worker = self.worker.lock().unwrap();
+        if worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+            // 終了したreaderの返り値がPTYを所有している。回収して解放する。
+            let finished = worker.take().unwrap();
+            std::thread::spawn(move || {
+                let _ = finished.join();
+            });
+            self.mark_disconnected();
+        }
+        drop(worker);
         for event in self.events.try_iter() {
             let reply =
                 reply_to_event(event, &*self.term.lock(), window_size(self.cols, self.rows));
@@ -307,7 +409,17 @@ impl TerminalSession {
 
     /// 現在の表示グリッドを行ごとの run 列に変換する。
     pub fn snapshot(&self) -> Snapshot {
-        snapshot(&*self.term.lock(), self.cols, self.rows)
+        let mut view = snapshot(&*self.term.lock(), self.cols, self.rows);
+        if self.state() != SessionState::Running {
+            view.cursor = None;
+        }
+        view
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -509,6 +621,7 @@ mod tests {
         let listener = WakeListener {
             wake: Arc::new(AtomicBool::new(false)),
             events,
+            state: Arc::new(AtomicI64::new(RUNNING)),
         };
         let mut term = Term::new(
             Config::default(),
@@ -776,6 +889,126 @@ print('mode-fixture-ok', flush=True)
             outputs.iter().all(|text| text.contains("mode-fixture-ok")),
             "{outputs:?}"
         );
+    }
+
+    #[test]
+    fn interactive_shell_preserves_nonzero_exit_codes() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "eren-shell-config-{}-{}",
+            std::process::id(),
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&config_dir).unwrap();
+        let env = HashMap::from([
+            ("ZDOTDIR".into(), config_dir.to_string_lossy().into_owned()),
+            ("HOME".into(), config_dir.to_string_lossy().into_owned()),
+        ]);
+        for input in [b"exit 7\r".as_slice(), b"exec /bin/sh -c 'exit 7'\r"] {
+            let session =
+                TerminalSession::spawn_in_env(&std::env::temp_dir(), 80, 24, None, env.clone())
+                    .unwrap();
+            // ログイン設定の完了を固定時間で仮定しない。
+            let ready = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !session.visible_text().contains("shell-probe-ready")
+                && std::time::Instant::now() < ready
+            {
+                session.write(b"printf '%s%s\\n' shell-probe- ready\r");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                session.process_events();
+            }
+            assert!(
+                session.visible_text().contains("shell-probe-ready"),
+                "{:?}",
+                session.visible_text()
+            );
+            session.write(input);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                session.process_events();
+                if session.worker.lock().unwrap().is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                session.state(),
+                SessionState::Exited(Some(7)),
+                "input: {input:?}, output: {:?}",
+                session.visible_text()
+            );
+        }
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn real_pty_exit_codes_disable_input_and_release_reader() {
+        for code in [0, 7] {
+            let command = format!("exec /bin/sh -c 'printf exit-fixture; exit {code}'");
+            let session =
+                TerminalSession::new_agent(&std::env::temp_dir(), 80, 24, &command).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                session.process_events();
+                if session.worker.lock().unwrap().is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(session.state(), SessionState::Exited(Some(code)));
+            assert!(session.worker.lock().unwrap().is_none());
+            assert!(session.visible_text().contains("exit-fixture"));
+            assert!(session.snapshot().cursor.is_none());
+            // 終了後の入力では履歴位置も変更しない。
+            session.term.lock().scroll_display(Scroll::Delta(1));
+            let offset = session.snapshot().display_offset;
+            session.write(b"ignored");
+            assert_eq!(session.snapshot().display_offset, offset);
+        }
+    }
+
+    #[test]
+    fn failed_spawn_does_not_disconnect_existing_session_and_retry_succeeds() {
+        let session = TerminalSession::new_agent(
+            &std::env::temp_dir(),
+            80,
+            24,
+            "exec /bin/sh -c 'printf spawn-ready; read input; printf %s%s spawn- still-ok'",
+        )
+        .unwrap();
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !session.visible_text().contains("spawn-ready")
+            && std::time::Instant::now() < ready_deadline
+        {
+            session.process_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(session.visible_text().contains("spawn-ready"));
+        let missing = std::env::temp_dir().join(format!(
+            "eren-missing-{}-{}",
+            std::process::id(),
+            session.id()
+        ));
+        assert!(!missing.exists());
+        assert!(TerminalSession::new(&missing, 80, 24).is_err());
+        assert_eq!(session.state(), SessionState::Running);
+        session.write(b"x\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            session.process_events();
+            if session.visible_text().contains("spawn-still-ok") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            session.visible_text().contains("spawn-still-ok"),
+            "{:?}",
+            session.visible_text()
+        );
+        let retry = TerminalSession::new(&std::env::temp_dir(), 80, 24).unwrap();
+        assert_eq!(retry.state(), SessionState::Running);
+        retry.shutdown();
+        session.shutdown();
     }
 
     #[test]

@@ -1931,10 +1931,14 @@ impl Workbench {
         }
         for (index, tab) in self.sessions.iter().enumerate() {
             let active = index == self.active_session;
-            let dot_color = match tab.detector.status() {
-                agents::AgentStatus::Running => 0x6cb6ff,
-                agents::AgentStatus::WaitingForInput => 0xe5c07b,
-                agents::AgentStatus::Starting | agents::AgentStatus::Unknown => 0x697586,
+            let dot_color = if tab.session.state() != terminal::SessionState::Running {
+                0xe9b4aa
+            } else {
+                match tab.detector.status() {
+                    agents::AgentStatus::Running => 0x6cb6ff,
+                    agents::AgentStatus::WaitingForInput => 0xe5c07b,
+                    agents::AgentStatus::Starting | agents::AgentStatus::Unknown => 0x697586,
+                }
             };
             let mut row = div()
                 .id(("session-row", index as u64))
@@ -1961,7 +1965,11 @@ impl Workbench {
                         .text_ellipsis()
                         .whitespace_nowrap()
                         .text_size(px(12.))
-                        .child(tab.title.clone()),
+                        .child(if tab.session.state() == terminal::SessionState::Running {
+                            tab.title.clone()
+                        } else {
+                            format!("{}（終了）", tab.title)
+                        }),
                 );
             if active {
                 row = row.bg(rgb(SURFACE));
@@ -2804,6 +2812,24 @@ impl Workbench {
         cx.notify();
     }
 
+    fn restart_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.sessions.get(index) else {
+            return;
+        };
+        let kind = tab.detector.kind();
+        let title = tab.title.clone();
+        if self.spawn_session(kind) {
+            let mut replacement = self.sessions.pop().unwrap();
+            replacement.title = title;
+            let old = std::mem::replace(&mut self.sessions[index], replacement);
+            old.session.shutdown();
+            self.term_selection = None;
+            self.terminal_focus.focus(window, cx);
+            self.save_state();
+        }
+        cx.notify();
+    }
+
     fn commit_terminal_text(&mut self, text: &str) {
         let active = self.terminal().map(TerminalSession::id);
         let target = self.ime.take_target(active);
@@ -2929,16 +2955,40 @@ impl Workbench {
                 })
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_editor(window, cx))),
         );
-        let panel = div().v_flex().flex_1().min_w_0().h_full().child(header);
-
+        let mut panel = div().v_flex().flex_1().min_w_0().h_full().child(header);
         if let Some(error) = &self.session_error {
-            return panel.child(
+            panel = panel.child(
                 div()
-                    .flex_1()
-                    .v_flex()
+                    .h_flex()
                     .items_center()
-                    .justify_center()
-                    .child(div().text_color(rgb(0xe9b4aa)).child(error.clone())),
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(0xe9b4aa))
+                            .child(error.clone()),
+                    )
+                    .child(
+                        Button::new("retry-session")
+                            .ghost()
+                            .small()
+                            .label("シェルを再試行")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_session(agents::AgentKind::Shell, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("dismiss-session-error")
+                            .ghost()
+                            .small()
+                            .label("閉じる")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.session_error = None;
+                                cx.notify();
+                            })),
+                    ),
             );
         }
         let Some(session) = self.terminal() else {
@@ -2956,6 +3006,35 @@ impl Workbench {
             );
         };
 
+        if let Some(message) = session.state().exit_message() {
+            panel = panel.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(div().flex_1().text_color(rgb(MUTED)).child(message))
+                    .child(
+                        Button::new("restart-session")
+                            .ghost()
+                            .small()
+                            .label("再起動")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.restart_session(this.active_session, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("close-exited-session")
+                            .ghost()
+                            .small()
+                            .label("閉じる")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_session(this.active_session, cx)
+                            })),
+                    ),
+            );
+        }
         let snapshot = session.snapshot();
         let default_bg = snapshot.default_bg;
         let scrolled_up = snapshot.display_offset > 0;
@@ -3528,6 +3607,11 @@ fn byte_to_utf16(s: &str, byte: usize) -> usize {
 /// ターミナルの IME 入力。仮想ドキュメントは変換中文字列のみで、
 /// 確定した文字列はそのまま PTY へ送る。
 impl EntityInputHandler for Workbench {
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.terminal()
+            .is_some_and(|session| session.state() == terminal::SessionState::Running)
+    }
+
     fn text_for_range(
         &mut self,
         range: std::ops::Range<usize>,

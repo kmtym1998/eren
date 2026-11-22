@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS checks
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # PTY fixtures use python3 and only its standard library.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustc --version --verbose
+          python3 --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Test (including real PTY fixtures)
+        run: cargo test --locked --all-targets
+
+      - name: Clippy (all targets)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build native macOS binary
+        run: cargo build --locked
+
+      - name: Verify lockfile is unchanged
+        run: git diff --exit-code -- Cargo.lock
