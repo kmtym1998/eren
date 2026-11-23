@@ -34,6 +34,13 @@ source "$HOME/.cargo/env"
 リポジトリのルートで実行する。`rust-toolchain.toml` の固定Rustを使い、依存は `Cargo.lock` に従う。初回の依存取得とビルドには時間がかかる。
 
 ```bash
+make build    # 開発用ビルド: target/debug/eren
+make release  # リリースビルド: target/release/eren
+```
+
+アプリを起動するには次を実行する。
+
+```bash
 cargo run --locked -- /path/to/project
 ```
 
